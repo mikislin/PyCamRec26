@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycamrec"
+version = "0.1.0rc1"
+description = "Basler-focused video acquisition recorder"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.23",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+basler = ["pypylon==4.0.0"]
+preview = ["opencv-python>=4.8"]
+
+[project.scripts]
+pycamrec = "pycamrec.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pycamrec*"]
