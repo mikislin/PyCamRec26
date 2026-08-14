@@ -11,6 +11,7 @@
 - Prepared all three CXP configs for 30/60-second repeated rollover qualification; lossless is preview-off first, while near-lossless and compact modes qualify preview on and off independently.
 - Curated package data explicitly, added a reproducible Conda/Tk environment, expanded Windows CI to Python 3.10-3.12, and added a release-file audit manifest.
 - Pinned the verified Windows GUI runtime to Python 3.11.13 / Tk 8.6.14 after Tcl/Tk 8.6.15 failed initialization in the target Conda environment.
+- Added the Python 3.10 `tomli` test backport and current Node 24-based GitHub Actions versions for a clean 3.10-3.12 CI matrix.
 
 ## 0.2.0rc1 - 2026-08-14
 

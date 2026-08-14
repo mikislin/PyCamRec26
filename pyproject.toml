@@ -18,7 +18,10 @@ dependencies = [
 [project.optional-dependencies]
 basler = ["pypylon==4.0.0"]
 preview = ["opencv-python>=4.8"]
-test = ["pytest>=8"]
+test = [
+  "pytest>=8",
+  "tomli>=2; python_version < '3.11'",
+]
 
 [project.urls]
 Homepage = "https://github.com/mikislin/PyCamRec26"
