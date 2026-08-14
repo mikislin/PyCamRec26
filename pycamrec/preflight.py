@@ -43,12 +43,12 @@ def run_preflight(cfg: PyCamRecConfig) -> PreflightReport:
         estimated_capacity_s = disk_usage.free / bytes_per_second if bytes_per_second > 0 else None
 
     warnings: list[str] = []
-    missing_experiment_fields = cfg.experiment.missing_fields()
-    if missing_experiment_fields:
+    experiment_issues = cfg.experiment.readiness_issues()
+    if experiment_issues:
         warnings.append(
-            "Experiment metadata has UNSPECIFIED fields: "
-            + ", ".join(missing_experiment_fields)
-            + ". Fill the experiment section before scientific recording."
+            "Experiment metadata is incomplete or invalid: "
+            + "; ".join(experiment_issues)
+            + ". Resolve it before scientific recording."
         )
     min_free_bytes = cfg.writer.min_free_space_gb * 1024**3
     if disk_usage.free < min_free_bytes:

@@ -15,7 +15,7 @@ import tkinter as tk
 import base64
 import logging
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime, timezone
 from fractions import Fraction
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -28,7 +28,9 @@ from .onboarding import generate_camera_config
 from .pixel_formats import is_bayer_pixel_format as is_bayer_camera_pixel_format
 from .pixel_formats import is_mono_pixel_format, is_rgb_pixel_format
 from .preflight import parse_pfs_features, run_preflight
+from .profiles import profile_claims_losslessness
 from .report import build_session_report
+from .session_index import discover_session_dirs
 
 
 MODULE_PARENT = Path(__file__).resolve().parents[1]
@@ -75,16 +77,35 @@ SCIENTIFIC_PREVIEW_PROFILE_IDS = {
 }
 
 METADATA_FIELDS = (
-    ("animal_id", "Animal ID"),
-    ("dob", "DOB"),
-    ("test_assay_name", "Test / assay name"),
+    ("project_id", "Project ID"),
+    ("protocol_id", "Protocol ID"),
+    ("assay_id", "Assay / task ID"),
+    ("subject_id", "Subject ID"),
+    ("species", "Species"),
+    ("date_of_birth", "Date of birth (YYYY-MM-DD)"),
+    ("postnatal_day", "Postnatal day (P0 = birth date)"),
+    ("weight_g", "Weight (g)"),
+    ("weight_measured_utc", "Weight measured (ISO-8601, optional)"),
     ("genotype", "Genotype"),
     ("experimental_group", "Experimental group"),
     ("sex", "Sex"),
-    ("experimentator", "Experimentator"),
-    ("project_protocol", "Project / protocol"),
-    ("camera_profile_path", "Camera profile path"),
+    ("experimenter_id", "Experimenter ID"),
+    ("run_index", "Run index"),
 )
+REQUIRED_METADATA_FIELDS = {
+    "project_id",
+    "protocol_id",
+    "assay_id",
+    "subject_id",
+    "species",
+    "postnatal_day",
+    "weight_g",
+    "genotype",
+    "experimental_group",
+    "sex",
+    "experimenter_id",
+    "run_index",
+}
 
 SESSION_RE = re.compile(
     r"(?:Finalized|Interrupted session finalized|Stopped at)\s+(.+?)\.\s+Camera",
@@ -153,8 +174,10 @@ class PyCamRecApp:
         self.onboard_segment_seconds_var = tk.StringVar(value="120")
         self.onboard_durations_var = tk.StringVar(value="30")
         self.onboard_preview_var = tk.StringVar(value="both")
+        self.onboard_repeats_var = tk.StringVar(value="3")
         self.onboard_hash_every_var = tk.StringVar(value="10")
         self.onboard_hash_max_var = tk.StringVar(value="100")
+        self.task_quality_record_var = tk.StringVar(value="")
         self.onboard_status_var = tk.StringVar(value="Generate a candidate config, then run evidence validation.")
 
         self.status_var = tk.StringVar(value="Idle")
@@ -170,10 +193,13 @@ class PyCamRecApp:
         self.preview_status_var = tk.StringVar(value="Preview panel ready")
         self.metadata_status_var = tk.StringVar(value="Fields default to UNSPECIFIED until filled.")
 
+        metadata_defaults = {"species": "mouse", "run_index": "1"}
         self.metadata_vars = {
-            field_name: tk.StringVar(value="UNSPECIFIED") for field_name, _ in METADATA_FIELDS
+            field_name: tk.StringVar(value=metadata_defaults.get(field_name, ""))
+            for field_name, _ in METADATA_FIELDS
         }
         self.notes_text: tk.Text | None = None
+        self.custom_fields_text: tk.Text | None = None
         self.start_buttons: list[ttk.Button] = []
         self.preview_start_buttons: list[ttk.Button] = []
         self.preview_stop_buttons: list[ttk.Button] = []
@@ -401,46 +427,67 @@ class PyCamRecApp:
         ttk.Label(frame, text="Experiment metadata", style="Header.TLabel").grid(
             row=0,
             column=0,
-            columnspan=3,
+            columnspan=4,
             sticky=tk.W,
             pady=(0, 8),
         )
-        for row, (field_name, label) in enumerate(METADATA_FIELDS, start=1):
-            ttk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, pady=3)
-            ttk.Entry(frame, textvariable=self.metadata_vars[field_name]).grid(
-                row=row,
-                column=1,
+        field_rows = (len(METADATA_FIELDS) + 1) // 2
+        for index, (field_name, label) in enumerate(METADATA_FIELDS):
+            form_row = index % field_rows + 1
+            base_column = 0 if index < field_rows else 2
+            ttk.Label(frame, text=label).grid(row=form_row, column=base_column, sticky=tk.W, pady=3)
+            if field_name == "sex":
+                widget = ttk.Combobox(
+                    frame,
+                    textvariable=self.metadata_vars[field_name],
+                    values=("female", "male", "intersex", "unknown", "not_applicable"),
+                    state="readonly",
+                )
+            else:
+                widget = ttk.Entry(frame, textvariable=self.metadata_vars[field_name])
+            widget.grid(
+                row=form_row,
+                column=base_column + 1,
                 sticky=tk.EW,
                 pady=3,
-                padx=(8, 4),
+                padx=(8, 12),
             )
-            if field_name == "camera_profile_path":
-                ttk.Button(frame, text="Use PFS", command=self.use_selected_config_as_camera_profile).grid(
-                    row=row,
-                    column=2,
-                    sticky=tk.EW,
-                )
 
-        ttk.Label(frame, text="Notes").grid(row=10, column=0, sticky=tk.NW, pady=3)
-        self.notes_text = tk.Text(frame, height=6, wrap=tk.WORD)
-        self.notes_text.grid(row=10, column=1, columnspan=2, sticky=tk.NSEW, pady=3, padx=(8, 0))
+        custom_row = field_rows + 1
+        ttk.Label(frame, text="Custom fields (JSON)").grid(row=custom_row, column=0, sticky=tk.NW, pady=3)
+        custom_container = ttk.Frame(frame)
+        custom_container.grid(row=custom_row, column=1, columnspan=3, sticky=tk.NSEW, pady=3, padx=(8, 0))
+        self.custom_fields_text = tk.Text(custom_container, height=3, wrap=tk.NONE)
+        self.custom_fields_text.pack(fill=tk.BOTH, expand=True)
+        self.custom_fields_text.insert("1.0", '{}')
+        ttk.Label(
+            custom_container,
+            text='Example: {"arena_id":"A03", "lighting_lux":120}',
+            style="Small.TLabel",
+        ).pack(anchor=tk.W)
+
+        notes_row = custom_row + 1
+        ttk.Label(frame, text="Notes").grid(row=notes_row, column=0, sticky=tk.NW, pady=3)
+        self.notes_text = tk.Text(frame, height=4, wrap=tk.WORD)
+        self.notes_text.grid(row=notes_row, column=1, columnspan=3, sticky=tk.NSEW, pady=3, padx=(8, 0))
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=11, column=1, columnspan=2, sticky=tk.W, pady=(10, 0), padx=(8, 0))
+        buttons.grid(row=notes_row + 1, column=1, columnspan=3, sticky=tk.W, pady=(10, 0), padx=(8, 0))
         ttk.Button(buttons, text="Check metadata", command=self.check_metadata).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Reset", command=self.reset_metadata).pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Label(frame, textvariable=self.metadata_status_var, wraplength=500).grid(
-            row=12,
+            row=notes_row + 2,
             column=1,
-            columnspan=2,
+            columnspan=3,
             sticky=tk.W,
             pady=(8, 0),
             padx=(8, 0),
         )
 
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(10, weight=1)
+        frame.columnconfigure(3, weight=1)
+        frame.rowconfigure(notes_row, weight=1)
 
     def _build_validation_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=10)
@@ -504,15 +551,27 @@ class PyCamRecApp:
             state="readonly",
             width=16,
         ).grid(row=6, column=1, sticky=tk.W, pady=3, padx=(8, 4))
-        ttk.Label(frame, text="Hash every / max").grid(row=7, column=0, sticky=tk.W, pady=3)
+        ttk.Label(frame, text="Required repetitions").grid(row=7, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(frame, textvariable=self.onboard_repeats_var, width=16).grid(
+            row=7, column=1, sticky=tk.W, pady=3, padx=(8, 4)
+        )
+        ttk.Label(frame, text="Hash every / max").grid(row=8, column=0, sticky=tk.W, pady=3)
         hash_frame = ttk.Frame(frame)
-        hash_frame.grid(row=7, column=1, sticky=tk.W, pady=3, padx=(8, 4))
+        hash_frame.grid(row=8, column=1, sticky=tk.W, pady=3, padx=(8, 4))
         ttk.Entry(hash_frame, textvariable=self.onboard_hash_every_var, width=8).pack(side=tk.LEFT)
         ttk.Label(hash_frame, text="/").pack(side=tk.LEFT, padx=4)
         ttk.Entry(hash_frame, textvariable=self.onboard_hash_max_var, width=8).pack(side=tk.LEFT)
 
+        ttk.Label(frame, text="Task-quality record").grid(row=9, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(frame, textvariable=self.task_quality_record_var).grid(
+            row=9, column=1, sticky=tk.EW, pady=3, padx=(8, 4)
+        )
+        ttk.Button(frame, text="Browse", command=self.browse_task_quality_record).grid(
+            row=9, column=2, sticky=tk.W
+        )
+
         buttons = ttk.Frame(frame)
-        buttons.grid(row=8, column=1, columnspan=2, sticky=tk.W, pady=(12, 4), padx=(8, 4))
+        buttons.grid(row=10, column=1, columnspan=2, sticky=tk.W, pady=(12, 4), padx=(8, 4))
         ttk.Button(buttons, text="Detect camera caps", command=self.detect_camera_capabilities).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Generate config", command=self.generate_onboarding_config).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(buttons, text="Run validation sweep", command=self.run_onboarding_sweep).pack(side=tk.LEFT, padx=(8, 0))
@@ -520,7 +579,7 @@ class PyCamRecApp:
         ttk.Button(buttons, text="Open sweeps", command=self.open_validation_sweeps).pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Label(frame, textvariable=self.onboard_status_var, wraplength=560, justify=tk.LEFT).grid(
-            row=9,
+            row=11,
             column=0,
             columnspan=3,
             sticky=tk.W,
@@ -536,7 +595,7 @@ class PyCamRecApp:
             wraplength=650,
             justify=tk.LEFT,
             style="Small.TLabel",
-        ).grid(row=10, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ).grid(row=12, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
         frame.columnconfigure(1, weight=1)
 
     def _build_reports_tab(self) -> None:
@@ -726,20 +785,21 @@ class PyCamRecApp:
             self.camera_profile_var.set(path)
             self._load_profile_summary()
 
+    def browse_task_quality_record(self) -> None:
+        path = filedialog.askopenfilename(
+            initialdir=str(WORKSPACE_ROOT / "qualification"),
+            title="Select task-quality evidence JSON",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if path:
+            self.task_quality_record_var.set(path)
+
     def browse_output_root(self) -> None:
         path = filedialog.askdirectory(initialdir=self.output_root_var.get() or str(DEFAULT_OUTPUT_ROOT))
         if path:
             self.output_root_var.set(path)
             self.refresh_sessions()
             self._load_profile_summary()
-
-    def use_selected_config_as_camera_profile(self) -> None:
-        camera_profile = self.camera_profile_var.get().strip()
-        if camera_profile:
-            self.metadata_vars["camera_profile_path"].set(str(Path(camera_profile).expanduser().resolve()))
-        else:
-            self.metadata_vars["camera_profile_path"].set(str(Path(self.config_var.get()).resolve()))
-        self.check_metadata()
 
     def generate_onboarding_config(self) -> None:
         try:
@@ -843,8 +903,37 @@ class PyCamRecApp:
             return
         try:
             config_path = self._write_runtime_config(preview_enabled_override=False)
+            cfg = load_config(config_path)
             hash_every = int(float(self.onboard_hash_every_var.get()))
             hash_max = int(float(self.onboard_hash_max_var.get()))
+            repeats = int(self.onboard_repeats_var.get())
+            if repeats < 3:
+                raise ValueError("Scientific qualification requires at least three repetitions.")
+            durations = [
+                float(value.strip())
+                for value in self.onboard_durations_var.get().split(",")
+                if value.strip()
+            ]
+            if not durations or any(value <= 0 for value in durations):
+                raise ValueError("Sweep durations must be positive comma-separated seconds.")
+            preview_case_count = 2 if self.onboard_preview_var.get() == "both" else 1
+            bitrate = cfg.writer.expected_bitrate_mbps or cfg.recording_profile.expected_bitrate_mbps
+            estimated_bytes = (
+                sum(durations) * repeats * preview_case_count * float(bitrate) * 1_000_000 / 8
+                if bitrate
+                else None
+            )
+            if max(durations) > 30:
+                estimate = _format_bytes(estimated_bytes) if estimated_bytes is not None else "unknown"
+                if not messagebox.askyesno(
+                    "Confirm storage-intensive validation",
+                    f"This qualification includes runs longer than 30 seconds.\n\n"
+                    f"Cases: {len(durations) * repeats * preview_case_count}\n"
+                    f"Estimated total output: {estimate}\n"
+                    f"Required repetitions: {repeats}\n\n"
+                    "Continue only after confirming free space and camera cooling.",
+                ):
+                    return
             command = [
                 sys.executable,
                 "-m",
@@ -863,14 +952,35 @@ class PyCamRecApp:
                 self.preview_width_var.get(),
                 "--preview-fps",
                 self.preview_fps_var.get(),
-                "--verify-session-pixels",
-                "--pixel-max-decode-frames",
-                "1000",
-                "--source-frame-hash-every",
-                str(hash_every),
-                "--source-frame-hash-max-frames",
-                str(hash_max),
+                "--repeats",
+                str(repeats),
+                "--required-passing-repeats",
+                str(repeats),
             ]
+            if profile_claims_losslessness(cfg.recording_profile.pixel_fidelity):
+                command.extend(
+                    [
+                        "--verify-session-pixels",
+                        "--pixel-max-decode-frames",
+                        "1000",
+                        "--source-frame-hash-every",
+                        str(hash_every),
+                        "--source-frame-hash-max-frames",
+                        str(hash_max),
+                    ]
+                )
+            qualification = cfg.raw.get("qualification") if isinstance(cfg.raw, dict) else {}
+            task_quality_required = bool(
+                isinstance(qualification, dict)
+                and qualification.get("require_task_quality_record", False)
+            )
+            task_quality_path = self.task_quality_record_var.get().strip()
+            if task_quality_required and not task_quality_path:
+                raise ValueError(
+                    "This lossy profile requires a passing task-quality record before qualification."
+                )
+            if task_quality_path:
+                command.extend(["--task-quality-record", task_quality_path])
             if self.allow_unspecified_var.get():
                 command.append("--allow-unspecified-metadata")
             else:
@@ -918,16 +1028,30 @@ class PyCamRecApp:
 
     def reset_metadata(self) -> None:
         for field_name, _ in METADATA_FIELDS:
-            self.metadata_vars[field_name].set("UNSPECIFIED")
+            self.metadata_vars[field_name].set(
+                "mouse" if field_name == "species" else "1" if field_name == "run_index" else ""
+            )
+        if self.custom_fields_text is not None:
+            self.custom_fields_text.delete("1.0", tk.END)
+            self.custom_fields_text.insert("1.0", "{}")
         if self.notes_text is not None:
             self.notes_text.delete("1.0", tk.END)
         self.metadata_status_var.set("Fields reset to UNSPECIFIED.")
         self._refresh_start_state()
 
     def check_metadata(self) -> bool:
-        missing = self._missing_metadata_fields()
-        if missing:
-            self.metadata_status_var.set("Missing: " + ", ".join(missing))
+        try:
+            runtime_config = self._write_runtime_config()
+            cfg = load_config(runtime_config)
+            issues = cfg.experiment.readiness_issues(
+                recording_date=datetime.now(timezone.utc).date()
+            )
+        except Exception as exc:
+            self.metadata_status_var.set(f"Invalid metadata: {exc}")
+            self._refresh_start_state()
+            return False
+        if issues:
+            self.metadata_status_var.set("Metadata issues: " + "; ".join(issues))
             self._refresh_start_state()
             return False
         self.metadata_status_var.set("Metadata complete.")
@@ -1199,11 +1323,7 @@ class PyCamRecApp:
         self.session_list.delete(0, tk.END)
         if not root.exists():
             return
-        sessions = sorted(
-            [path for path in root.iterdir() if path.is_dir()],
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
+        sessions = discover_session_dirs(root)
         for session in sessions[:250]:
             self.session_list.insert(tk.END, str(session))
 
@@ -1409,6 +1529,18 @@ class PyCamRecApp:
             self.onboard_expected_fps_var.set(f"{cfg.camera.expected_fps:g}")
         if not self.onboard_segment_seconds_var.get().strip():
             self.onboard_segment_seconds_var.set(f"{cfg.writer.segment_seconds:g}")
+        qualification = cfg.raw.get("qualification") if isinstance(cfg.raw, dict) else {}
+        if isinstance(qualification, dict) and qualification:
+            durations = qualification.get("durations_s") or []
+            if durations:
+                self.onboard_durations_var.set(",".join(f"{float(value):g}" for value in durations))
+            preview_modes = [str(value).lower() for value in qualification.get("preview_modes") or []]
+            if set(preview_modes) == {"off", "on"}:
+                self.onboard_preview_var.set("both")
+            elif preview_modes:
+                self.onboard_preview_var.set(preview_modes[0])
+            if qualification.get("required_repeats") is not None:
+                self.onboard_repeats_var.set(str(int(qualification["required_repeats"])))
         profile = cfg.recording_profile
         try:
             segment_seconds = self._segment_seconds(fallback=cfg.writer.segment_seconds)
@@ -1420,7 +1552,8 @@ class PyCamRecApp:
             f"Camera {cfg.camera.make} serial {cfg.camera.serial} | "
             f"{cfg.camera.expected_pixel_format} {cfg.camera.expected_width}x{cfg.camera.expected_height} "
             f"@ {cfg.camera.expected_fps:g} fps | output .{cfg.writer.container} | segment {segment_seconds:g}s\n"
-            f"Temperature warning {cfg.camera.temperature_warning_c:g} C; health checks every "
+            f"Temperature warning/critical {cfg.camera.temperature_warning_c:g}/"
+            f"{cfg.camera.temperature_critical_c:g} C; health checks every "
             f"{cfg.camera.health_check_interval_s:g}s. {profile.recommended_use}"
         )
         self.disk_estimate_var.set(_disk_estimate_text(cfg))
@@ -1569,20 +1702,71 @@ class PyCamRecApp:
                 "Mismatches: " + "; ".join(mismatches)
             )
 
-    def _metadata_values(self) -> dict[str, str]:
+    def _metadata_values(self) -> dict[str, Any]:
         values = {field_name: var.get().strip() for field_name, var in self.metadata_vars.items()}
+        postnatal_day = _optional_gui_int(values["postnatal_day"], "Postnatal day")
+        weight_g = _optional_gui_float(values["weight_g"], "Weight")
+        run_index = _optional_gui_int(values["run_index"], "Run index")
+        if run_index is None:
+            raise ValueError("Run index is required.")
+        custom_text = (
+            self.custom_fields_text.get("1.0", tk.END).strip()
+            if self.custom_fields_text is not None
+            else "{}"
+        )
+        try:
+            custom_fields = json.loads(custom_text or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Custom fields must be valid JSON: {exc.msg}") from exc
+        if not isinstance(custom_fields, dict):
+            raise ValueError("Custom fields JSON must be an object.")
+        postnatal_day_source = "manual"
+        if values["date_of_birth"] and postnatal_day is not None:
+            try:
+                birth_date = date.fromisoformat(values["date_of_birth"])
+            except ValueError:
+                pass
+            else:
+                if (datetime.now(timezone.utc).date() - birth_date).days == postnatal_day:
+                    postnatal_day_source = "derived_from_date_of_birth"
         if self.notes_text is not None:
-            values["notes"] = self.notes_text.get("1.0", tk.END).strip()
+            notes = self.notes_text.get("1.0", tk.END).strip()
         else:
-            values["notes"] = ""
-        return values
+            notes = ""
+        return {
+            "schema_version": 2,
+            "project": {
+                "project_id": values["project_id"],
+                "protocol_id": values["protocol_id"],
+                "assay_id": values["assay_id"],
+            },
+            "subject": {
+                "subject_id": values["subject_id"],
+                "species": values["species"],
+                "date_of_birth": values["date_of_birth"],
+                "postnatal_day": postnatal_day,
+                "postnatal_day_source": postnatal_day_source,
+                "p0_convention": "birth_date_is_p0",
+                "weight_g": weight_g,
+                "weight_measured_utc": values["weight_measured_utc"],
+                "genotype": values["genotype"],
+                "experimental_group": values["experimental_group"],
+                "sex": values["sex"],
+            },
+            "acquisition": {
+                "experimenter_id": values["experimenter_id"],
+                "run_index": run_index,
+            },
+            "custom_fields": custom_fields,
+            "notes": notes,
+        }
 
     def _missing_metadata_fields(self) -> list[str]:
-        values = self._metadata_values()
+        values = {field_name: var.get().strip() for field_name, var in self.metadata_vars.items()}
         return [
             field_name
-            for field_name, _ in METADATA_FIELDS
-            if values.get(field_name, "").strip() in {"", "UNSPECIFIED"}
+            for field_name in REQUIRED_METADATA_FIELDS
+            if values.get(field_name, "").strip().upper() in {"", "UNSPECIFIED"}
         ]
 
     def _duration_s(self) -> float:
@@ -2163,6 +2347,26 @@ def _qc_display_text(status: str) -> str:
     if status == "in_progress":
         return "IN PROGRESS"
     return status.replace("_", " ").upper()
+
+
+def _optional_gui_int(value: str, label: str) -> int | None:
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an integer.") from exc
+
+
+def _optional_gui_float(value: str, label: str) -> float | None:
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be numeric.") from exc
 
 
 def _disk_estimate_text(cfg: Any) -> str:

@@ -97,11 +97,43 @@ def session_hardware_fingerprint(session_dir: Path) -> dict[str, Any]:
     )
 
 
+def build_profile_fingerprint(
+    *,
+    camera_config: dict[str, Any],
+    writer_config: dict[str, Any],
+    recording_profile: dict[str, Any],
+    preview_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Hash every resolved acquisition/encoding setting covered by a profile approval."""
+
+    stable_preview = dict(preview_config)
+    # Runtime shared-memory/file locations identify one GUI process, not profile behavior.
+    stable_preview.pop("image_path", None)
+    stable_preview.pop("window_title", None)
+    if not bool(stable_preview.get("enabled")):
+        stable_preview = {"enabled": False}
+    payload = {
+        "schema_version": 1,
+        "camera": _jsonable(camera_config),
+        "writer": _jsonable(writer_config),
+        "recording_profile": _jsonable(recording_profile),
+        "preview": _jsonable(stable_preview),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return {
+        "schema_version": 1,
+        "fingerprint_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "payload": payload,
+    }
+
+
 def evaluate_profile_approval(
     approval_config: dict[str, Any] | None,
     *,
     evidence_fingerprint_sha256: str,
+    profile_fingerprint_sha256: str,
     preview_enabled: bool,
+    duration_s: float,
 ) -> dict[str, Any]:
     """Evaluate a configured lock against the exact current evidence fingerprint."""
 
@@ -109,11 +141,18 @@ def evaluate_profile_approval(
     status = str(approval.get("status") or "requires_hardware_validation")
     locked = status.startswith("locked")
     configured_fingerprint = str(approval.get("evidence_fingerprint_sha256") or "")
+    configured_profile_fingerprint = str(approval.get("profile_fingerprint_sha256") or "")
+    validated_max_duration_s = _optional_float(approval.get("validated_max_duration_s"))
     intended_preview_mode = str(approval.get("intended_preview_mode") or "off").strip().lower()
     actual_preview_mode = "on" if preview_enabled else "off"
     fingerprint_match = bool(configured_fingerprint) and configured_fingerprint == evidence_fingerprint_sha256
+    profile_fingerprint_match = (
+        bool(configured_profile_fingerprint)
+        and configured_profile_fingerprint == profile_fingerprint_sha256
+    )
     preview_mode_match = intended_preview_mode == actual_preview_mode
-    approved = locked and fingerprint_match and preview_mode_match
+    duration_match = validated_max_duration_s is not None and duration_s <= validated_max_duration_s
+    approved = locked and fingerprint_match and profile_fingerprint_match and preview_mode_match and duration_match
     reasons: list[str] = []
     if not locked:
         reasons.append("profile status is not locked")
@@ -121,9 +160,19 @@ def evaluate_profile_approval(
         reasons.append("approved evidence fingerprint is missing")
     elif not fingerprint_match:
         reasons.append("camera/PFS/GPU/driver/host/software evidence fingerprint changed")
+    if not configured_profile_fingerprint:
+        reasons.append("approved resolved profile fingerprint is missing")
+    elif not profile_fingerprint_match:
+        reasons.append("camera/writer/profile/preview settings changed")
     if not preview_mode_match:
         reasons.append(
             f"intended preview mode is {intended_preview_mode!r}, current mode is {actual_preview_mode!r}"
+        )
+    if validated_max_duration_s is None:
+        reasons.append("validated maximum duration is missing")
+    elif not duration_match:
+        reasons.append(
+            f"requested duration {duration_s:g}s exceeds validated maximum {validated_max_duration_s:g}s"
         )
     return {
         "status": status,
@@ -132,11 +181,38 @@ def evaluate_profile_approval(
         "configured_evidence_fingerprint_sha256": configured_fingerprint,
         "current_evidence_fingerprint_sha256": evidence_fingerprint_sha256,
         "fingerprint_match": fingerprint_match,
+        "configured_profile_fingerprint_sha256": configured_profile_fingerprint,
+        "current_profile_fingerprint_sha256": profile_fingerprint_sha256,
+        "profile_fingerprint_match": profile_fingerprint_match,
         "intended_preview_mode": intended_preview_mode,
         "actual_preview_mode": actual_preview_mode,
         "preview_mode_match": preview_mode_match,
+        "validated_max_duration_s": validated_max_duration_s,
+        "requested_duration_s": duration_s,
+        "duration_match": duration_match,
         "reasons": reasons,
     }
+
+
+def _optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    return value
 
 
 def _pypylon_version() -> str:

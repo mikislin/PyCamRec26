@@ -69,6 +69,8 @@ def build_session_report(session_dir: Path) -> dict[str, Any]:
         else 0
     )
     drops = [_to_int(row.get("dropped_before_frame")) or 0 for row in frames]
+    queue_tail = queue_depths[max(0, int(len(queue_depths) * 0.8)) :]
+    queue_tail_slope = _linear_slope(queue_tail)
 
     host_diffs = _diffs(host_ts)
     cam_diffs = _diffs(cam_ts)
@@ -104,6 +106,7 @@ def build_session_report(session_dir: Path) -> dict[str, Any]:
         "profile_approval": session.get("profile_approval") or {},
         "hardware_fingerprint": session.get("hardware_fingerprint")
         or (session_hardware_fingerprint(session_dir) if session_path.is_file() else {}),
+        "profile_fingerprint": session.get("profile_fingerprint") or {},
         "analysis": _analysis_report(session, analysis_manifest, analysis_manifest_path),
         "pixel_verification": pixel_verification,
         "frames": {
@@ -127,6 +130,14 @@ def build_session_report(session_dir: Path) -> dict[str, Any]:
         "camera_timestamp_raw": _diff_report(cam_raw_diffs, scale=None),
         "queue": {
             "max_depth": queue_max,
+            "end_depth": queue_depths[-1] if queue_depths else 0,
+            "tail_sample_count": len(queue_tail),
+            "tail_slope_frames_per_frame": queue_tail_slope,
+            "tail_slope_frames_per_s": (
+                queue_tail_slope * float(expected_fps)
+                if queue_tail_slope is not None and expected_fps is not None
+                else None
+            ),
             "rows_at_max_depth": rows_at_queue_max,
             "frames_csv_max_depth": queue_frames_max,
             "session_summary_max_depth": queue_summary_max,
@@ -192,6 +203,21 @@ def _to_float(value: Any) -> float | None:
 
 def _diffs(values: list[int]) -> list[int]:
     return [values[index] - values[index - 1] for index in range(1, len(values))]
+
+
+def _linear_slope(values: list[int]) -> float | None:
+    if len(values) < 2:
+        return None
+    count = len(values)
+    mean_x = (count - 1) / 2.0
+    mean_y = sum(values) / count
+    denominator = sum((index - mean_x) ** 2 for index in range(count))
+    if denominator == 0:
+        return 0.0
+    return sum(
+        (index - mean_x) * (value - mean_y)
+        for index, value in enumerate(values)
+    ) / denominator
 
 
 def _diff_report(diffs: list[int], scale: float | None) -> dict[str, Any]:
@@ -273,12 +299,20 @@ def _health_report(events: list[dict[str, Any]]) -> dict[str, Any]:
     warning_events = [
         event
         for event in health_events
-        if event["payload"].get("warnings") or event["payload"].get("status") == "warning"
+        if event["payload"].get("warnings")
+        or event["payload"].get("critical")
+        or event["payload"].get("status") in {"warning", "critical"}
+    ]
+    critical_events = [
+        event
+        for event in health_events
+        if event["payload"].get("critical") or event["payload"].get("status") == "critical"
     ]
     last_payload = health_events[-1]["payload"]
     return {
         "checks": len(health_events),
         "warning_checks": len(warning_events),
+        "critical_checks": len(critical_events),
         "min_free_space_gb": min(free_values) if free_values else None,
         "last_free_space_gb": _to_float(last_payload.get("free_space_gb")),
         "max_camera_temperature_c": max(temperature_values) if temperature_values else None,
@@ -343,14 +377,24 @@ def _experiment_metadata_report(document: dict[str, Any], path: Path) -> dict[st
         return {
             "metadata_complete": False,
             "missing_fixed_fields": [],
+            "validation_issues": [],
             "fixed_fields": {},
+            "project": {},
+            "subject": {},
+            "acquisition": {},
+            "custom_fields": {},
             "file_present": False,
             "path": str(path),
         }
     return {
         "metadata_complete": document.get("metadata_complete"),
         "missing_fixed_fields": document.get("missing_fixed_fields") or [],
+        "validation_issues": document.get("validation_issues") or [],
         "fixed_fields": document.get("fixed_fields") or {},
+        "project": document.get("project") or {},
+        "subject": document.get("subject") or {},
+        "acquisition": document.get("acquisition") or {},
+        "custom_fields": document.get("custom_fields") or {},
         "file_present": True,
         "path": str(path),
     }
@@ -397,6 +441,16 @@ def _qc_report(report: dict[str, Any], session: dict[str, Any]) -> dict[str, Any
     profile_approval = report.get("profile_approval", {})
     expected_fps = _to_float(_nested(session, ["resolved", "camera", "expected_fps"]))
     queue_max_frames = _to_float(_nested(session, ["resolved", "writer", "queue_max_frames"]))
+    temperature_warning_c = _to_float(
+        _nested(session, ["resolved", "camera", "temperature_warning_c"])
+    )
+    temperature_critical_c = _to_float(
+        _nested(session, ["resolved", "camera", "temperature_critical_c"])
+    )
+    min_free_space_gb = _to_float(
+        _nested(session, ["resolved", "writer", "min_free_space_gb"])
+    )
+    health_required = (_to_int_like(session.get("schema_version")) or 1) >= 2
 
     frame_count = _to_int_like(frames.get("count"))
     expected_frames = _to_int_like(frames.get("expected"))
@@ -409,6 +463,7 @@ def _qc_report(report: dict[str, Any], session: dict[str, Any]) -> dict[str, Any
     frames_with_frame_index = _to_int_like(frames.get("frames_with_frame_index")) or 0
     drop_sum = _to_int_like(frames.get("drop_sum")) or 0
     max_queue_depth = _to_int_like(queue.get("max_depth")) or 0
+    queue_tail_slope = _to_float(queue.get("tail_slope_frames_per_s"))
     approx_fps = _to_float(host_timing.get("approx_fps"))
 
     if not session_state.get("finalized"):
@@ -419,6 +474,10 @@ def _qc_report(report: dict[str, Any], session: dict[str, Any]) -> dict[str, Any
             "realtime_timing_pass": False,
             "queue_pass": False,
             "queue_margin_pass": False,
+            "queue_growth_pass": False,
+            "thermal_pass": False,
+            "storage_pass": False,
+            "health_pass": False,
             "pixel_pass": False,
             "metadata_pass": bool(experiment_metadata.get("metadata_complete")),
             "profile_approval_pass": bool(profile_approval.get("approved")),
@@ -467,9 +526,11 @@ def _qc_report(report: dict[str, Any], session: dict[str, Any]) -> dict[str, Any
 
     queue_pass = False
     queue_margin_pass = False
+    queue_growth_pass = False
     if queue_max_frames:
         queue_pass = max_queue_depth < int(queue_max_frames * 0.90)
         queue_margin_pass = max_queue_depth < queue_max_frames * 0.25
+        queue_growth_pass = queue_tail_slope is not None and queue_tail_slope <= 0.5
         if not queue_pass:
             issues.append(
                 f"Queue pressure failed: max queue depth {max_queue_depth} reached at least 90% "
@@ -479,6 +540,12 @@ def _qc_report(report: dict[str, Any], session: dict[str, Any]) -> dict[str, Any
             warnings.append(
                 f"Queue passed the 90% failure limit but exceeded the 25% profile-lock margin: "
                 f"{max_queue_depth}/{int(queue_max_frames)}."
+            )
+        if queue_tail_slope is None:
+            warnings.append("Queue growth could not be evaluated from the final 20% of frames.")
+        elif not queue_growth_pass:
+            warnings.append(
+                f"Writer backlog was still growing near session end: {queue_tail_slope:.2f} frames/s."
             )
     else:
         warnings.append("Queue capacity is missing; queue safety cannot pass.")
@@ -490,6 +557,33 @@ def _qc_report(report: dict[str, Any], session: dict[str, Any]) -> dict[str, Any
     if health.get("warning_checks"):
         warnings.append("Health warnings were recorded; inspect temperature and free-space trend.")
 
+    max_temperature_c = _to_float(health.get("max_camera_temperature_c"))
+    minimum_free_gb = _to_float(health.get("min_free_space_gb"))
+    thermal_pass = (
+        max_temperature_c is not None
+        and temperature_critical_c is not None
+        and max_temperature_c < temperature_critical_c
+    )
+    storage_pass = (
+        minimum_free_gb is not None
+        and min_free_space_gb is not None
+        and minimum_free_gb >= min_free_space_gb
+    )
+    if not health_required and max_temperature_c is None:
+        thermal_pass = True
+    if not health_required and minimum_free_gb is None:
+        storage_pass = True
+    if health_required and max_temperature_c is None:
+        warnings.append("Camera temperature evidence is missing; experiment readiness cannot pass.")
+    elif max_temperature_c is not None and temperature_warning_c is not None and max_temperature_c >= temperature_warning_c:
+        warnings.append(
+            f"Camera temperature reached {max_temperature_c:.1f} C, above the "
+            f"{temperature_warning_c:.1f} C warning threshold."
+        )
+    if health_required and minimum_free_gb is None:
+        warnings.append("Periodic free-space evidence is missing; experiment readiness cannot pass.")
+    health_pass = thermal_pass and storage_pass
+
     if preview.get("enabled") and (not realtime_timing_pass or not queue_pass):
         warnings.append("Preview was enabled during a run with real-time or queue pressure; rerun with preview off or at lower FPS/width for scientific validation.")
 
@@ -497,8 +591,15 @@ def _qc_report(report: dict[str, Any], session: dict[str, Any]) -> dict[str, Any
         warnings.append("experiment_metadata.json was not found; session predates Phase 3 metadata or metadata write failed.")
     elif experiment_metadata.get("metadata_complete") is False:
         missing = experiment_metadata.get("missing_fixed_fields") or []
+        metadata_validation_issues = experiment_metadata.get("validation_issues") or []
         if missing:
             warnings.append("Experiment metadata is incomplete: " + ", ".join(str(item) for item in missing) + ".")
+        if metadata_validation_issues:
+            warnings.append(
+                "Experiment metadata is invalid: "
+                + "; ".join(str(item) for item in metadata_validation_issues)
+                + "."
+            )
 
     metadata_pass = bool(experiment_metadata.get("metadata_complete"))
     lossless_claim = profile_claims_losslessness(str(profile.get("pixel_fidelity") or ""))
@@ -519,7 +620,7 @@ def _qc_report(report: dict[str, Any], session: dict[str, Any]) -> dict[str, Any
         warnings.append("Profile approval is not valid for this run: " + "; ".join(map(str, reasons)) + ".")
 
     qc_pass = acquisition_pass and realtime_timing_pass and queue_pass
-    evidence_ready = qc_pass and metadata_pass and (pixel_pass if lossless_claim else True)
+    evidence_ready = qc_pass and health_pass and metadata_pass and (pixel_pass if lossless_claim else True)
     experiment_ready = evidence_ready and approval_pass
 
     if qc_pass:
@@ -539,6 +640,10 @@ def _qc_report(report: dict[str, Any], session: dict[str, Any]) -> dict[str, Any
         "realtime_timing_pass": realtime_timing_pass,
         "queue_pass": queue_pass,
         "queue_margin_pass": queue_margin_pass,
+        "queue_growth_pass": queue_growth_pass,
+        "thermal_pass": thermal_pass,
+        "storage_pass": storage_pass,
+        "health_pass": health_pass,
         "qc_pass": qc_pass,
         "pixel_verification_required": lossless_claim,
         "pixel_status": pixel_status,

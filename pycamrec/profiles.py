@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-PROFILE_VERSION = "2026-08-14"
+PROFILE_VERSION = "0.2.0rc2-2026-08-14"
 REQUIRES_HARDWARE_VALIDATION = "requires_hardware_validation"
 
 

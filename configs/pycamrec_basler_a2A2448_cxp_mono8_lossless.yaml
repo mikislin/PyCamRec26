@@ -19,7 +19,10 @@ camera:
   max_num_buffer: 512
   enable_chunks: true
   strict_validation: true
-  temperature_warning_c: 40.0
+  # DeviceTemperature warning/error thresholds for this model are 76/81 C;
+  # qualify below the conservative 70 C warning and never reach 76 C critical.
+  temperature_warning_c: 70.0
+  temperature_critical_c: 76.0
   health_check_interval_s: 10.0
 
 writer:
@@ -30,15 +33,27 @@ writer:
   ffprobe_path: C:/ffmpeg/ffmpeg-2025-09-28-git-0fdb5829e3-full_build/bin/ffprobe.exe
 
 experiment:
-  animal_id: UNSPECIFIED
-  dob: UNSPECIFIED
-  test_assay_name: UNSPECIFIED
-  genotype: UNSPECIFIED
-  experimental_group: UNSPECIFIED
-  sex: UNSPECIFIED
-  experimentator: UNSPECIFIED
-  project_protocol: UNSPECIFIED
-  camera_profile_path: UNSPECIFIED
+  schema_version: 2
+  project:
+    project_id: UNSPECIFIED
+    protocol_id: UNSPECIFIED
+    assay_id: UNSPECIFIED
+  subject:
+    subject_id: UNSPECIFIED
+    species: mouse
+    date_of_birth: ""
+    postnatal_day: null
+    postnatal_day_source: manual
+    p0_convention: birth_date_is_p0
+    weight_g: null
+    weight_measured_utc: ""
+    genotype: UNSPECIFIED
+    experimental_group: UNSPECIFIED
+    sex: UNSPECIFIED
+  acquisition:
+    experimenter_id: UNSPECIFIED
+    run_index: 1
+  custom_fields: {}
   notes: ""
 
 metadata:
@@ -63,3 +78,11 @@ approval:
   status: requires_hardware_validation
   intended_preview_mode: off
   evidence_fingerprint_sha256: ""
+
+qualification:
+  policy: cxp_profile_lock_v2
+  durations_s: [30, 60]
+  required_repeats: 3
+  preview_modes: ["off"]
+  require_exact_pixel_samples: true
+  require_task_quality_record: false

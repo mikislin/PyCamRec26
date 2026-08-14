@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycamrec"
-version = "0.2.0rc1"
+version = "0.2.0rc2"
 description = "Basler-focused scientific video acquisition recorder built from CamPy lessons."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,7 +37,19 @@ include = ["pycamrec*"]
   "acA1300-200uc_24188001.pfs",
   "acA1300-200uc_24188001_mono8.pfs",
 ]
-"share/pycamrec/configs" = ["configs/*.yaml"]
+"share/pycamrec/configs" = [
+  "configs/pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml",
+  "configs/pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml",
+  "configs/pycamrec_basler_a2A2448_cxp_mono8_near_lossless.yaml",
+  "configs/pycamrec_basler_acA1300_usb_mono8_cv_optimal.yaml",
+  "configs/pycamrec_basler_acA1300_usb_mono8_lossless.yaml",
+  "configs/pycamrec_basler_acA1300_usb_mono8_near_lossless.yaml",
+]
+"share/pycamrec/schemas" = [
+  "schemas/experiment_metadata_v2.schema.json",
+  "schemas/task_quality_record_v1.schema.json",
+]
+"share/pycamrec/qualification" = ["qualification/task_quality_record.template.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -74,6 +74,9 @@ def load_config(
     profile_config, profile_writer_defaults = _load_profile(profile_data)
     writer_data = _merge_dicts(profile_writer_defaults, dict(data.get("writer", {})))
     experiment_data = dict(data.get("experiment", {}))
+    project_data = dict(experiment_data.get("project", {}))
+    subject_data = dict(experiment_data.get("subject", {}))
+    acquisition_data = dict(experiment_data.get("acquisition", {}))
     metadata_data = dict(data.get("metadata", {}))
     preview_data = dict(data.get("preview", {}))
 
@@ -107,6 +110,7 @@ def load_config(
         allow_runtime_pixel_format_override=bool(camera_data.get("allow_runtime_pixel_format_override", False)),
         allow_runtime_frame_rate_override=bool(camera_data.get("allow_runtime_frame_rate_override", False)),
         temperature_warning_c=float(camera_data.get("temperature_warning_c", 40.0)),
+        temperature_critical_c=float(camera_data.get("temperature_critical_c", 76.0)),
         health_check_interval_s=float(camera_data.get("health_check_interval_s", 10.0)),
     )
 
@@ -150,15 +154,77 @@ def load_config(
     )
 
     experiment = ExperimentMetadataConfig(
-        animal_id=str(experiment_data.get("animal_id", "UNSPECIFIED")),
-        dob=str(experiment_data.get("dob", "UNSPECIFIED")),
-        test_assay_name=str(experiment_data.get("test_assay_name", "UNSPECIFIED")),
-        genotype=str(experiment_data.get("genotype", "UNSPECIFIED")),
-        experimental_group=str(experiment_data.get("experimental_group", "UNSPECIFIED")),
-        sex=str(experiment_data.get("sex", "UNSPECIFIED")),
-        experimentator=str(experiment_data.get("experimentator", "UNSPECIFIED")),
-        project_protocol=str(experiment_data.get("project_protocol", "UNSPECIFIED")),
-        camera_profile_path=str(experiment_data.get("camera_profile_path", "UNSPECIFIED")),
+        schema_version=int(experiment_data.get("schema_version", 2)),
+        project_id=str(
+            project_data.get("project_id", experiment_data.get("project_id", "UNSPECIFIED"))
+        ),
+        protocol_id=str(
+            project_data.get(
+                "protocol_id",
+                experiment_data.get("protocol_id", experiment_data.get("project_protocol", "UNSPECIFIED")),
+            )
+        ),
+        assay_id=str(
+            project_data.get(
+                "assay_id",
+                experiment_data.get("assay_id", experiment_data.get("test_assay_name", "UNSPECIFIED")),
+            )
+        ),
+        subject_id=str(
+            subject_data.get(
+                "subject_id",
+                experiment_data.get("subject_id", experiment_data.get("animal_id", "UNSPECIFIED")),
+            )
+        ),
+        species=str(subject_data.get("species", experiment_data.get("species", "UNSPECIFIED"))),
+        date_of_birth=_optional_metadata_string(
+            subject_data.get(
+                "date_of_birth",
+                experiment_data.get("date_of_birth", experiment_data.get("dob", "")),
+            )
+        ),
+        postnatal_day=_optional_int(
+            subject_data.get("postnatal_day", experiment_data.get("postnatal_day")),
+            "experiment.subject.postnatal_day",
+        ),
+        postnatal_day_source=str(
+            subject_data.get(
+                "postnatal_day_source",
+                experiment_data.get("postnatal_day_source", "manual"),
+            )
+        ),
+        p0_convention=str(
+            subject_data.get(
+                "p0_convention",
+                experiment_data.get("p0_convention", "birth_date_is_p0"),
+            )
+        ),
+        weight_g=_optional_float(
+            subject_data.get("weight_g", experiment_data.get("weight_g")),
+            "experiment.subject.weight_g",
+        ),
+        weight_measured_utc=str(
+            subject_data.get(
+                "weight_measured_utc",
+                experiment_data.get("weight_measured_utc", ""),
+            )
+        ),
+        genotype=str(subject_data.get("genotype", experiment_data.get("genotype", "UNSPECIFIED"))),
+        experimental_group=str(
+            subject_data.get(
+                "experimental_group",
+                experiment_data.get("experimental_group", "UNSPECIFIED"),
+            )
+        ),
+        sex=str(subject_data.get("sex", experiment_data.get("sex", "UNSPECIFIED"))),
+        experimenter_id=str(
+            acquisition_data.get(
+                "experimenter_id",
+                experiment_data.get("experimenter_id", experiment_data.get("experimentator", "UNSPECIFIED")),
+            )
+        ),
+        run_index=int(acquisition_data.get("run_index", experiment_data.get("run_index", 1))),
+        custom_fields=_normalize_custom_fields(experiment_data.get("custom_fields", {})),
         notes=str(experiment_data.get("notes", "")),
     )
 
@@ -231,6 +297,8 @@ def validate_config(cfg: PyCamRecConfig) -> None:
         raise ValueError("camera.max_num_buffer must be positive.")
     if cfg.camera.temperature_warning_c <= 0:
         raise ValueError("camera.temperature_warning_c must be positive.")
+    if cfg.camera.temperature_critical_c <= cfg.camera.temperature_warning_c:
+        raise ValueError("camera.temperature_critical_c must be greater than temperature_warning_c.")
     if cfg.camera.health_check_interval_s <= 0:
         raise ValueError("camera.health_check_interval_s must be positive.")
     if cfg.session.duration_s <= 0:
@@ -289,6 +357,9 @@ def validate_config(cfg: PyCamRecConfig) -> None:
         raise ValueError("preview.sink must be 'window', 'file', 'pgm', 'shm', or 'shm_raw'.")
     if cfg.preview.sink in {"file", "pgm", "shm", "shm_raw"} and cfg.preview.enabled and cfg.preview.image_path is None:
         raise ValueError("preview.image_path is required for file-backed preview status.")
+    metadata_issues = cfg.experiment.validation_issues()
+    if metadata_issues:
+        raise ValueError("Invalid experiment metadata: " + "; ".join(metadata_issues))
 
 
 def _load_mapping(path: Path) -> Any:
@@ -342,3 +413,60 @@ def _resolve_path(value: str | os.PathLike[str], base_dir: Path) -> Path:
     if not path.is_absolute():
         path = base_dir / path
     return path.resolve()
+
+
+def _optional_int(value: Any, field_name: str) -> int | None:
+    if value in (None, "", "UNSPECIFIED"):
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer.")
+    try:
+        converted = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer.") from exc
+    if isinstance(value, float) and value != converted:
+        raise ValueError(f"{field_name} must be an integer.")
+    return converted
+
+
+def _optional_metadata_string(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if text.upper() == "UNSPECIFIED" else text
+
+
+def _optional_float(value: Any, field_name: str) -> float | None:
+    if value in (None, "", "UNSPECIFIED"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be numeric.") from exc
+
+
+def _normalize_custom_fields(value: Any) -> dict[str, dict[str, Any]]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("experiment.custom_fields must be a mapping.")
+    result: dict[str, dict[str, Any]] = {}
+    for key, raw_item in value.items():
+        name = str(key).strip()
+        if isinstance(raw_item, dict):
+            item = dict(raw_item)
+        else:
+            item = {"value": raw_item, "value_type": _custom_value_type(raw_item)}
+        item.setdefault("value_type", _custom_value_type(item.get("value")))
+        if item.get("unit") is None:
+            item.pop("unit", None)
+        result[name] = item
+    return result
+
+
+def _custom_value_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return "string"

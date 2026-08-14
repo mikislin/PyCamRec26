@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mikislin/PyCamRec26/blob/main/schemas/experiment_metadata_v2.schema.json",
+  "title": "PyCamRec experiment metadata v2",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "schema_uri",
+    "metadata_complete",
+    "missing_fixed_fields",
+    "validation_issues",
+    "project",
+    "subject",
+    "acquisition",
+    "custom_fields",
+    "automatic"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "schema_uri": {"type": "string", "format": "uri"},
+    "metadata_complete": {"type": "boolean"},
+    "missing_fixed_fields": {"type": "array", "items": {"type": "string"}},
+    "validation_issues": {"type": "array", "items": {"type": "string"}},
+    "project": {
+      "type": "object",
+      "required": ["project_id", "protocol_id", "assay_id"],
+      "properties": {
+        "project_id": {"type": "string", "minLength": 1},
+        "protocol_id": {"type": "string", "minLength": 1},
+        "assay_id": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "subject": {
+      "type": "object",
+      "required": [
+        "subject_id",
+        "species",
+        "postnatal_day",
+        "postnatal_day_source",
+        "p0_convention",
+        "weight_g",
+        "genotype",
+        "experimental_group",
+        "sex"
+      ],
+      "properties": {
+        "subject_id": {"type": "string", "minLength": 1},
+        "species": {"type": "string", "minLength": 1},
+        "date_of_birth": {"type": ["string", "null"], "format": "date"},
+        "postnatal_day": {"type": ["integer", "null"], "minimum": 0},
+        "postnatal_day_source": {
+          "enum": ["manual", "derived_from_date_of_birth"]
+        },
+        "p0_convention": {"const": "birth_date_is_p0"},
+        "weight_g": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "weight_measured_utc": {"type": ["string", "null"], "format": "date-time"},
+        "genotype": {"type": "string"},
+        "experimental_group": {"type": "string"},
+        "sex": {
+          "enum": ["female", "male", "intersex", "unknown", "not_applicable", "UNSPECIFIED"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "acquisition": {
+      "type": "object",
+      "required": ["experimenter_id", "run_index"],
+      "properties": {
+        "experimenter_id": {"type": "string", "minLength": 1},
+        "run_index": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "custom_fields": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,63}$"},
+      "additionalProperties": {
+        "type": "object",
+        "required": ["value", "value_type"],
+        "properties": {
+          "value": {"type": ["string", "number", "integer", "boolean"]},
+          "value_type": {"enum": ["string", "number", "integer", "boolean"]},
+          "unit": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "notes": {"type": "string"},
+    "fixed_fields": {"type": "object"},
+    "automatic": {"type": "object"}
+  },
+  "additionalProperties": false
+}

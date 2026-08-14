@@ -18,6 +18,7 @@ from .config import load_config
 from .hardware import session_hardware_fingerprint
 from .report import build_session_report
 from .profiles import profile_claims_losslessness
+from .qualification import load_task_quality_record
 from .verify import verify_session_pixels
 
 
@@ -47,6 +48,7 @@ class SweepResult:
     bitrate_mbps: float
     bitrate_override: bool
     preview_enabled: bool
+    repeat: int
     session_dir: str
     return_code: int
     qc_status: str
@@ -60,6 +62,7 @@ class SweepResult:
     queue_capacity: int | None
     queue_fraction: float | None
     preferred_queue_pass: bool | None
+    queue_growth_pass: bool | None
     block_id_gaps: int | None
     drop_sum: int | None
     metadata_complete: bool | None
@@ -75,6 +78,11 @@ class SweepResult:
     pixel_fidelity: str
     lossless_claim: bool
     hardware_fingerprint_sha256: str
+    profile_fingerprint_sha256: str
+    max_camera_temperature_c: float | None
+    thermal_pass: bool
+    storage_pass: bool
+    health_pass: bool
     technical_pass: bool
     evidence_ready: bool
     profile_approval_pass: bool
@@ -107,6 +115,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Validation segment length. Default is at most half of each case so rollover is exercised.",
     )
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument(
+        "--required-passing-repeats",
+        type=int,
+        default=3,
+        help="Passing repetitions required at the maximum duration before a lock is recommended.",
+    )
     parser.add_argument("--min-fps-ratio", type=float, default=0.98)
     parser.add_argument("--max-queue-fraction", type=float, default=0.90)
     parser.add_argument("--preferred-max-queue-fraction", type=float, default=0.25)
@@ -138,11 +152,27 @@ def main(argv: list[str] | None = None) -> int:
         help="Validation-only: maximum source hashes to write. 0 means no limit.",
     )
     parser.add_argument("--allow-unspecified-metadata", action="store_true")
+    parser.add_argument(
+        "--task-quality-record",
+        type=Path,
+        help="JSON evidence that lossy compression passed predefined scientific task metrics.",
+    )
     parser.add_argument("--stop-on-fail", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
     base_cfg = load_config(args.config, duration_s=1.0, output_root=args.output_root)
+    qualification_policy = (
+        base_cfg.raw.get("qualification")
+        if isinstance(base_cfg.raw, dict) and isinstance(base_cfg.raw.get("qualification"), dict)
+        else {}
+    )
+    task_quality = load_task_quality_record(
+        args.task_quality_record,
+        profile_id=base_cfg.recording_profile.id,
+        profile_version=base_cfg.recording_profile.version,
+        required=bool(qualification_policy.get("require_task_quality_record", False)),
+    )
     parsed_bitrates = _parse_float_list(args.bitrates)
     cases = _build_cases(
         durations=_parse_float_list(args.durations),
@@ -207,6 +237,8 @@ def main(argv: list[str] | None = None) -> int:
         preferred_max_queue_fraction=args.preferred_max_queue_fraction,
         require_complete_metadata=args.require_complete_metadata,
         verify_pixels=args.verify_session_pixels,
+        required_passing_repeats=args.required_passing_repeats,
+        task_quality=task_quality,
     )
 
     return 0 if any(result.qc_pass for result in results) else 1
@@ -296,6 +328,14 @@ def _write_runtime_config(
     preview["enabled"] = case.preview_enabled
     preview["width"] = case.preview_width
     preview["max_fps"] = case.preview_fps
+    qualification = data.get("qualification")
+    qualification = qualification if isinstance(qualification, dict) else {}
+    if case.preview_enabled and qualification.get("preview_sink"):
+        preview["sink"] = str(qualification["preview_sink"])
+        if preview["sink"] in {"shm", "shm_raw"}:
+            preview["image_path"] = str(
+                runtime_path.with_name(f"preview_{case.case_id}.pgm").resolve()
+            )
     data["preview"] = preview
 
     writer = dict(data.get("writer", {}))
@@ -410,6 +450,7 @@ def _run_case(
     qc = report.get("qc") or {}
     frames = report.get("frames") or {}
     queue = report.get("queue") or {}
+    health = report.get("health") or {}
     segments = report.get("segments") or {}
     session_state = report.get("session_state") or {}
     profile = report.get("recording_profile") or {}
@@ -456,6 +497,8 @@ def _run_case(
             pixel_status = "error"
             pixel_error = repr(exc)
     hardware_fingerprint = session_hardware_fingerprint(Path(session_dir))
+    session_document = json.loads((Path(session_dir) / "session.json").read_text(encoding="utf-8"))
+    profile_fingerprint = session_document.get("profile_fingerprint") or {}
     acquisition_pass = (
         return_code == 0
         and bool(qc.get("acquisition_pass"))
@@ -481,7 +524,11 @@ def _run_case(
     qc_pass = acquisition_pass and rate_pass and queue_pass and qc.get("status") == "pass"
     technical_pass = qc_pass
     pixel_pass = pixel_verified if lossless_claim else True
-    evidence_ready = qc_pass and pixel_pass and metadata_complete
+    thermal_pass = bool(qc.get("thermal_pass"))
+    storage_pass = bool(qc.get("storage_pass"))
+    health_pass = bool(qc.get("health_pass"))
+    queue_growth_pass = bool(qc.get("queue_growth_pass"))
+    evidence_ready = qc_pass and health_pass and pixel_pass and metadata_complete
     profile_approval_pass = bool(profile_approval.get("approved"))
     experiment_ready = evidence_ready and profile_approval_pass
     scientific_pass = experiment_ready
@@ -491,6 +538,7 @@ def _run_case(
         bitrate_mbps=case.bitrate_mbps,
         bitrate_override=case.bitrate_override,
         preview_enabled=case.preview_enabled,
+        repeat=case.repeat,
         session_dir=session_dir,
         return_code=return_code,
         qc_status=str(qc.get("status") or "unknown"),
@@ -508,6 +556,7 @@ def _run_case(
             if max_queue is not None and queue_capacity is not None
             else None
         ),
+        queue_growth_pass=queue_growth_pass,
         block_id_gaps=block_id_gaps,
         drop_sum=drop_sum,
         metadata_complete=metadata_complete,
@@ -523,6 +572,11 @@ def _run_case(
         pixel_fidelity=pixel_fidelity,
         lossless_claim=lossless_claim,
         hardware_fingerprint_sha256=str(hardware_fingerprint.get("fingerprint_sha256") or ""),
+        profile_fingerprint_sha256=str(profile_fingerprint.get("fingerprint_sha256") or ""),
+        max_camera_temperature_c=_to_float(health.get("max_camera_temperature_c")),
+        thermal_pass=thermal_pass,
+        storage_pass=storage_pass,
+        health_pass=health_pass,
         technical_pass=technical_pass,
         evidence_ready=evidence_ready,
         profile_approval_pass=profile_approval_pass,
@@ -579,6 +633,7 @@ def _failed_result(
         bitrate_mbps=case.bitrate_mbps,
         bitrate_override=case.bitrate_override,
         preview_enabled=case.preview_enabled,
+        repeat=case.repeat,
         session_dir=session_dir,
         return_code=return_code,
         qc_status=qc_status,
@@ -592,6 +647,7 @@ def _failed_result(
         queue_capacity=None,
         queue_fraction=None,
         preferred_queue_pass=None,
+        queue_growth_pass=None,
         block_id_gaps=None,
         drop_sum=None,
         metadata_complete=None,
@@ -607,6 +663,11 @@ def _failed_result(
         pixel_fidelity="",
         lossless_claim=False,
         hardware_fingerprint_sha256="",
+        profile_fingerprint_sha256="",
+        max_camera_temperature_c=None,
+        thermal_pass=False,
+        storage_pass=False,
+        health_pass=False,
         technical_pass=False,
         evidence_ready=False,
         profile_approval_pass=False,
@@ -697,6 +758,8 @@ def _write_summary(
     preferred_max_queue_fraction: float,
     require_complete_metadata: bool,
     verify_pixels: bool,
+    required_passing_repeats: int,
+    task_quality: dict[str, Any],
 ) -> None:
     fingerprints = sorted({result.hardware_fingerprint_sha256 for result in results if result.hardware_fingerprint_sha256})
     technical_passes = [result for result in results if result.technical_pass]
@@ -723,7 +786,12 @@ def _write_summary(
             "max_queue_fraction_preferred": preferred_max_queue_fraction,
             "pixel_verification_required": verify_pixels,
             "metadata_complete_required": True,
+            "health_pass_required": True,
+            "queue_growth_max_frames_per_s": 0.5,
+            "passing_repeats_at_max_duration_required": required_passing_repeats,
+            "task_quality_record_required": bool(task_quality.get("required")),
         },
+        "task_quality_record": task_quality,
         "case_count": len(results),
         "acquisition_pass_count": len(acquisition_passes),
         "qc_pass_count": len(qc_passes),
@@ -731,17 +799,30 @@ def _write_summary(
         "scientific_pass_count": len(scientific_passes),
         "evidence_ready_count": len(evidence_ready_results),
         "preferred_pass_count": len(preferred_passes),
-        "profile_lock_recommendation": _profile_lock_recommendation(results, verify_pixels, require_complete_metadata),
+        "profile_lock_recommendation": _profile_lock_recommendation(
+            results,
+            verify_pixels,
+            require_complete_metadata,
+            required_passing_repeats,
+            bool(task_quality.get("required")),
+            bool(task_quality.get("pass")),
+        ),
         "profile_lock_by_preview_mode": {
             "preview_off": _profile_lock_recommendation(
                 [result for result in results if not result.preview_enabled],
                 verify_pixels,
                 require_complete_metadata,
+                required_passing_repeats,
+                bool(task_quality.get("required")),
+                bool(task_quality.get("pass")),
             ),
             "preview_on": _profile_lock_recommendation(
                 [result for result in results if result.preview_enabled],
                 verify_pixels,
                 require_complete_metadata,
+                required_passing_repeats,
+                bool(task_quality.get("required")),
+                bool(task_quality.get("pass")),
             ),
         },
         "best_scientific_pass": _best_result(scientific_passes),
@@ -758,6 +839,9 @@ def _profile_lock_recommendation(
     results: list[SweepResult],
     verify_pixels: bool,
     require_complete_metadata: bool,
+    required_passing_repeats: int = 3,
+    task_quality_required: bool = False,
+    task_quality_pass: bool = True,
 ) -> str:
     if not results:
         return "no_cases_run"
@@ -773,11 +857,31 @@ def _profile_lock_recommendation(
         return "do_not_lock_profile_pixel_verification_missing_or_failed"
     if any(not result.metadata_complete for result in results):
         return "do_not_lock_profile_metadata_incomplete"
+    if any(not result.health_pass for result in results):
+        return "do_not_lock_profile_health_evidence_failed"
+    if task_quality_required and not task_quality_pass:
+        return "do_not_lock_profile_task_quality_evidence_missing_or_failed"
     fingerprints = {result.hardware_fingerprint_sha256 for result in results if result.hardware_fingerprint_sha256}
     if len(fingerprints) != 1:
         return "do_not_lock_profile_mixed_or_missing_hardware_fingerprint"
+    max_duration = max(result.duration_s for result in results)
+    max_duration_results = [result for result in results if result.duration_s == max_duration]
+    profile_fingerprints = {
+        result.profile_fingerprint_sha256
+        for result in max_duration_results
+        if result.profile_fingerprint_sha256
+    }
+    if len(profile_fingerprints) != 1:
+        return "do_not_lock_profile_mixed_or_missing_resolved_profile_fingerprint"
     if any(result.preferred_queue_pass is not True for result in results):
         return "do_not_lock_profile_queue_above_25_percent_margin"
+    if any(result.queue_growth_pass is not True for result in results):
+        return "do_not_lock_profile_writer_backlog_still_growing"
+    max_duration_repeats = sum(
+        1 for result in max_duration_results if result.evidence_ready
+    )
+    if max_duration_repeats < required_passing_repeats:
+        return "do_not_lock_profile_insufficient_repetitions_at_max_duration"
     mode = "preview_on" if results[0].preview_enabled else "preview_off"
     return f"lock_validated_for_this_evidence_fingerprint_{mode}"
 

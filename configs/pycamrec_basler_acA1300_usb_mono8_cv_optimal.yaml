@@ -26,15 +26,27 @@ writer:
   ffmpeg_path: C:/ffmpeg/ffmpeg-2025-09-28-git-0fdb5829e3-full_build/bin/ffmpeg.exe
   ffprobe_path: C:/ffmpeg/ffmpeg-2025-09-28-git-0fdb5829e3-full_build/bin/ffprobe.exe
 experiment:
-  animal_id: UNSPECIFIED
-  dob: UNSPECIFIED
-  test_assay_name: UNSPECIFIED
-  genotype: UNSPECIFIED
-  experimental_group: UNSPECIFIED
-  sex: UNSPECIFIED
-  experimentator: UNSPECIFIED
-  project_protocol: UNSPECIFIED
-  camera_profile_path: UNSPECIFIED
+  schema_version: 2
+  project:
+    project_id: UNSPECIFIED
+    protocol_id: UNSPECIFIED
+    assay_id: UNSPECIFIED
+  subject:
+    subject_id: UNSPECIFIED
+    species: mouse
+    date_of_birth: ""
+    postnatal_day: null
+    postnatal_day_source: manual
+    p0_convention: birth_date_is_p0
+    weight_g: null
+    weight_measured_utc: ""
+    genotype: UNSPECIFIED
+    experimental_group: UNSPECIFIED
+    sex: UNSPECIFIED
+  acquisition:
+    experimenter_id: UNSPECIFIED
+    run_index: 1
+  custom_fields: {}
   notes: ""
 metadata:
   per_frame_format: csv

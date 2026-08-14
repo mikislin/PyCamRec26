@@ -8,10 +8,11 @@ import shutil
 import socket
 import subprocess
 import sys
-import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any
 
 from . import __release_stage__, __version__
@@ -65,13 +66,17 @@ class MetadataWriter:
         device_info: dict[str, Any],
         *,
         evidence_fingerprint: dict[str, Any] | None = None,
+        profile_fingerprint: dict[str, Any] | None = None,
         profile_approval: dict[str, Any] | None = None,
     ):
         self.cfg = cfg
         self.preflight = preflight
         self.device_info = device_info
         self._evidence_fingerprint = evidence_fingerprint
+        self._profile_fingerprint = profile_fingerprint or {}
         self._profile_approval = profile_approval or {}
+        self.created_at = datetime.now(timezone.utc)
+        self.session_id = uuid.uuid4().hex
         self.session_dir = self._make_session_dir()
         self.segments_dir = self.session_dir / "segments"
         self.segments_dir.mkdir(parents=True, exist_ok=False)
@@ -142,15 +147,25 @@ class MetadataWriter:
         self._closed = True
 
     def _make_session_dir(self) -> Path:
-        root = self.cfg.session.output_root
+        root = self.cfg.session.output_root.expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.cfg.session.name)
-        session_dir = root / f"{timestamp}_{safe_name}_{self.cfg.camera.serial}"
-        if session_dir.exists():
-            suffix = time.perf_counter_ns()
-            session_dir = root / f"{timestamp}_{safe_name}_{self.cfg.camera.serial}_{suffix}"
-        session_dir.mkdir(parents=False, exist_ok=False)
+        project_slug = _path_slug(self.cfg.experiment.project_id)
+        subject_slug = _path_slug(self.cfg.experiment.subject_id)
+        assay_slug = _path_slug(self.cfg.experiment.assay_id)
+        date_slug = self.created_at.strftime("%Y-%m-%d")
+        timestamp = self.created_at.strftime("%Y%m%dT%H%M%S") + f"{self.created_at.microsecond // 1000:03d}Z"
+        session_name = (
+            f"{timestamp}__task-{assay_slug}__run-{self.cfg.experiment.run_index:03d}"
+            f"__sid-{self.session_id}"
+        )
+        session_dir = (
+            root
+            / f"project-{project_slug}"
+            / f"subject-{subject_slug}"
+            / date_slug
+            / session_name
+        )
+        session_dir.mkdir(parents=True, exist_ok=False)
         return session_dir
 
     def _copy_inputs(self) -> None:
@@ -159,8 +174,10 @@ class MetadataWriter:
     def _write_session_json(self) -> None:
         hardware_fingerprint = self._hardware_fingerprint()
         session_doc = {
-            "schema_version": 1,
-            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "schema_version": 2,
+            "naming_schema_version": 1,
+            "session_id": self.session_id,
+            "created_utc": self.created_at.isoformat(),
             "host": socket.gethostname(),
             "config": _jsonable(self.cfg.raw),
             "resolved": {
@@ -175,6 +192,7 @@ class MetadataWriter:
             "preflight": _jsonable(asdict(self.preflight)),
             "device_info": _jsonable(self.device_info),
             "hardware_fingerprint": _jsonable(hardware_fingerprint),
+            "profile_fingerprint": _jsonable(self._profile_fingerprint),
             "profile_approval": _jsonable(self._profile_approval),
             "pfs_sha256_verified": sha256_file(self.cfg.camera.pfs_path),
             "experiment_metadata": self._experiment_metadata_document(),
@@ -200,8 +218,11 @@ class MetadataWriter:
         elif semantics in {"rgb", "bgr"}:
             preferred_mode = "color"
         document = {
-            "schema_version": 1,
-            "session_directory": str(self.session_dir),
+            "schema_version": 2,
+            "session_id": self.session_id,
+            "naming_schema_version": 1,
+            "session_directory_name": self.session_dir.name,
+            "relative_segments_directory": "segments",
             "camera": {
                 "serial": self.cfg.camera.serial,
                 "width": self.cfg.camera.expected_width,
@@ -241,9 +262,14 @@ class MetadataWriter:
         disk_usage = shutil.disk_usage(self.session_dir)
         experiment = asdict(self.cfg.experiment)
         missing_fields = self.cfg.experiment.missing_fields()
+        validation_issues = self.cfg.experiment.validation_issues(
+            recording_date=self.created_at.date()
+        )
         hardware_fingerprint = self._hardware_fingerprint()
         automatic: dict[str, Any] = {
-            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "created_utc": self.created_at.isoformat(),
+            "session_id": self.session_id,
+            "naming_schema_version": 1,
             "session_directory": str(self.session_dir),
             "session_directory_name": self.session_dir.name,
             "computer_name": socket.gethostname(),
@@ -283,9 +309,35 @@ class MetadataWriter:
                 automatic["disk"]["final_free_gb"] = summary.get("last_free_space_gb")
 
         return {
-            "schema_version": 1,
-            "metadata_complete": not missing_fields,
+            "schema_version": 2,
+            "schema_uri": "https://github.com/mikislin/PyCamRec26/blob/main/schemas/experiment_metadata_v2.schema.json",
+            "metadata_complete": not missing_fields and not validation_issues,
             "missing_fixed_fields": missing_fields,
+            "validation_issues": validation_issues,
+            "project": {
+                "project_id": experiment["project_id"],
+                "protocol_id": experiment["protocol_id"],
+                "assay_id": experiment["assay_id"],
+            },
+            "subject": {
+                "subject_id": experiment["subject_id"],
+                "species": experiment["species"],
+                "date_of_birth": experiment["date_of_birth"] or None,
+                "postnatal_day": experiment["postnatal_day"],
+                "postnatal_day_source": experiment["postnatal_day_source"],
+                "p0_convention": experiment["p0_convention"],
+                "weight_g": experiment["weight_g"],
+                "weight_measured_utc": experiment["weight_measured_utc"] or None,
+                "genotype": experiment["genotype"],
+                "experimental_group": experiment["experimental_group"],
+                "sex": experiment["sex"],
+            },
+            "acquisition": {
+                "experimenter_id": experiment["experimenter_id"],
+                "run_index": experiment["run_index"],
+            },
+            "custom_fields": experiment["custom_fields"],
+            "notes": experiment["notes"],
             "fixed_fields": experiment,
             "automatic": automatic,
         }
@@ -352,3 +404,11 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
     return value
+
+
+def _path_slug(value: str, *, fallback: str = "unspecified") -> str:
+    text = str(value or "").strip().lower()
+    if not text or text == "unspecified":
+        return fallback
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return (text[:48].rstrip("-") or fallback)

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .camera_backend import CameraBackend, GrabbedFrame, create_camera_backend
 from .metadata import FrameMetadata, MetadataWriter
-from .hardware import build_hardware_fingerprint, evaluate_profile_approval
+from .hardware import build_hardware_fingerprint, build_profile_fingerprint, evaluate_profile_approval
 from .preflight import PreflightReport
 from .preview import PreviewWorker
 from .schemas import PyCamRecConfig
@@ -44,6 +44,7 @@ class RecordingStats:
     queue_full_errors: int = 0
     health_checks: int = 0
     health_warnings: int = 0
+    health_critical_events: int = 0
     last_free_space_gb: float | None = None
     last_camera_temperature_c: float | None = None
     writer_spool_enabled: bool = False
@@ -95,10 +96,18 @@ class Recorder:
                 ffprobe_path=self.cfg.writer.ffprobe_path,
                 ffmpeg_version=self.preflight.ffmpeg_version,
             )
+            profile_fingerprint = build_profile_fingerprint(
+                camera_config=asdict(self.cfg.camera),
+                writer_config=asdict(self.cfg.writer),
+                recording_profile=asdict(self.cfg.recording_profile),
+                preview_config=asdict(self.cfg.preview),
+            )
             profile_approval = evaluate_profile_approval(
                 self.cfg.raw.get("approval") if isinstance(self.cfg.raw, dict) else {},
                 evidence_fingerprint_sha256=str(evidence_fingerprint.get("fingerprint_sha256") or ""),
+                profile_fingerprint_sha256=str(profile_fingerprint.get("fingerprint_sha256") or ""),
                 preview_enabled=self.cfg.preview.enabled,
+                duration_s=self.cfg.session.duration_s,
             )
             if profile_approval["locked"] and not profile_approval["approved"]:
                 raise RuntimeError(
@@ -111,6 +120,7 @@ class Recorder:
                 self.preflight,
                 camera.device_info,
                 evidence_fingerprint=evidence_fingerprint,
+                profile_fingerprint=profile_fingerprint,
                 profile_approval=profile_approval,
             )
             writer = FfmpegSegmentWriter(self.cfg, metadata.segments_dir)
@@ -436,13 +446,19 @@ class Recorder:
         free_space_gb = disk_usage.free / (1024**3)
         temperature_c = camera.read_temperature_c()
         warnings = []
+        critical = []
         if free_space_gb < self.cfg.writer.min_free_space_gb:
-            warnings.append(
+            critical.append(
                 f"free space {free_space_gb:.1f} GiB below {self.cfg.writer.min_free_space_gb:.1f} GiB"
             )
         if temperature_c is not None and temperature_c > self.cfg.camera.temperature_warning_c:
             warnings.append(
                 f"camera temperature {temperature_c:.1f} C above {self.cfg.camera.temperature_warning_c:.1f} C"
+            )
+        if temperature_c is not None and temperature_c >= self.cfg.camera.temperature_critical_c:
+            critical.append(
+                f"camera temperature {temperature_c:.1f} C reached critical "
+                f"{self.cfg.camera.temperature_critical_c:.1f} C"
             )
 
         self.stats.health_checks += 1
@@ -450,17 +466,17 @@ class Recorder:
         self.stats.last_camera_temperature_c = (
             round(temperature_c, 3) if temperature_c is not None else None
         )
-        if warnings:
-            self.stats.health_warnings += len(warnings)
+        self.stats.health_warnings += len(warnings)
+        self.stats.health_critical_events += len(critical)
 
-        status = "WARNING" if warnings else "OK"
+        status = "CRITICAL" if critical else "WARNING" if warnings else "OK"
         temperature_text = f"{temperature_c:.1f} C" if temperature_c is not None else "unknown"
         message = (
             f"[PyCamRec] Health {status}: segment={segment_id}, reason={reason}, "
             f"free={free_space_gb:.1f} GiB, camera_temp={temperature_text}"
         )
-        if warnings:
-            message += " (" + "; ".join(warnings) + ")"
+        if warnings or critical:
+            message += " (" + "; ".join(critical + warnings) + ")"
         print(message, flush=True)
         metadata.log_event(
             "segment_health",
@@ -474,10 +490,18 @@ class Recorder:
                     round(temperature_c, 3) if temperature_c is not None else None
                 ),
                 "temperature_warning_c": self.cfg.camera.temperature_warning_c,
+                "temperature_critical_c": self.cfg.camera.temperature_critical_c,
                 "min_free_space_gb": self.cfg.writer.min_free_space_gb,
                 "warnings": warnings,
+                "critical": critical,
             },
         )
+        if critical:
+            metadata.log_event(
+                "health_critical_stop_requested",
+                {"segment_id": segment_id, "reason": reason, "critical": critical},
+            )
+            self.stop_event.set()
 
 
 def _detect_gap(

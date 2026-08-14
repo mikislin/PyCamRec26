@@ -20,7 +20,9 @@ from .onboarding import generate_camera_config
 from .preflight import run_preflight
 from .preview_session import PreviewSession, stats_to_dict
 from .profiles import list_profile_dicts
+from .qualification import build_qualification_plan
 from .report import build_session_report
+from .session_index import write_session_index
 from .verify import benchmark_codecs, verify_lossless_codec, verify_session_pixels
 
 
@@ -41,6 +43,25 @@ def main(argv: list[str] | None = None) -> int:
 
     report_parser = subparsers.add_parser("report", help="Summarize a completed PyCamRec session.")
     report_parser.add_argument("session_dir", type=Path)
+
+    index_parser = subparsers.add_parser(
+        "index",
+        help="Build a portable one-row-per-session CSV or JSONL index for analysis.",
+    )
+    index_parser.add_argument("output_root", type=Path)
+    index_parser.add_argument("--output", type=Path, required=True)
+    index_parser.add_argument("--format", choices=("csv", "jsonl"), default="csv")
+    index_parser.add_argument(
+        "--include-qc",
+        action="store_true",
+        help="Run report/FFprobe for each session and include current readiness columns.",
+    )
+
+    qualification_parser = subparsers.add_parser(
+        "qualification-plan",
+        help="Show the cases, commands, and storage budget for CXP profile qualification without recording.",
+    )
+    qualification_parser.add_argument("config", type=Path)
 
     read_video_parser = subparsers.add_parser(
         "read-video",
@@ -204,6 +225,25 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(_jsonable(report), indent=2, sort_keys=True))
         return 0
 
+    if args.command == "index":
+        result = write_session_index(
+            args.output_root,
+            args.output,
+            output_format=args.format,
+            include_qc=args.include_qc,
+        )
+        print(json.dumps(_jsonable(result), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "qualification-plan":
+        try:
+            result = build_qualification_plan(args.config)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"ERROR: {exc}")
+            return 2
+        print(json.dumps(_jsonable(result), indent=2, sort_keys=True))
+        return 0
+
     if args.command == "read-video":
         try:
             report = inspect_video_read(args.video, mode=args.mode, frame_index=args.frame)
@@ -357,11 +397,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "record":
-        missing_metadata = cfg.experiment.missing_fields()
-        if missing_metadata and not args.allow_unspecified_metadata:
+        metadata_issues = cfg.experiment.readiness_issues()
+        if metadata_issues and not args.allow_unspecified_metadata:
             print(
-                "ERROR: Experiment metadata is incomplete. Fill these experiment fields before recording: "
-                + ", ".join(missing_metadata)
+                "ERROR: Experiment metadata is incomplete or invalid: "
+                + "; ".join(metadata_issues)
                 + ". For engineering-only tests, rerun with --allow-unspecified-metadata."
             )
             return 1

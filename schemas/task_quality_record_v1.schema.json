@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mikislin/PyCamRec26/blob/main/schemas/task_quality_record_v1.schema.json",
+  "title": "PyCamRec lossy-profile task quality record",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "profile_id",
+    "profile_version",
+    "status",
+    "reference_dataset_sha256",
+    "acceptance_criteria",
+    "metrics",
+    "evaluated_utc"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "profile_id": {"type": "string", "minLength": 1},
+    "profile_version": {"type": "string", "minLength": 1},
+    "status": {"enum": ["pass", "fail"]},
+    "reference_dataset_sha256": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+    "acceptance_criteria": {"type": "object", "minProperties": 1},
+    "metrics": {"type": "object", "minProperties": 1},
+    "evaluated_utc": {"type": "string", "format": "date-time"},
+    "notes": {"type": "string"}
+  },
+  "additionalProperties": false
+}

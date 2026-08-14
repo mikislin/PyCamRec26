@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import tomllib
 from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -17,10 +18,17 @@ from pycamrec.acquisition import _source_hash_frame_indices
 from pycamrec.approval import lock_profile_from_summary
 from pycamrec.config import load_config
 from pycamrec.gui import _disk_estimate_text, _integrated_preview_sink
-from pycamrec.hardware import build_hardware_fingerprint, evaluate_profile_approval
+from pycamrec.hardware import (
+    build_hardware_fingerprint,
+    build_profile_fingerprint,
+    evaluate_profile_approval,
+)
 from pycamrec.onboarding import generate_camera_config
+from pycamrec.metadata import MetadataWriter
+from pycamrec.preflight import PreflightReport
 from pycamrec.preview import PreviewWorker
 from pycamrec.report import build_session_report
+from pycamrec.qualification import build_qualification_plan, load_task_quality_record
 from pycamrec.schemas import (
     CameraConfig,
     ExperimentMetadataConfig,
@@ -31,7 +39,13 @@ from pycamrec.schemas import (
     SessionConfig,
     WriterConfig,
 )
-from pycamrec.validation_sweep import SweepResult, _profile_lock_recommendation
+from pycamrec.validation_sweep import (
+    SweepCase,
+    SweepResult,
+    _profile_lock_recommendation,
+    _write_runtime_config,
+)
+from pycamrec.session_index import discover_session_dirs, write_session_index
 from pycamrec.verify import _evenly_spaced_indices, _ffmpeg_gray_framemd5_hashes, verify_session_pixels
 from pycamrec.writer_ffmpeg import FfmpegSegmentWriter
 
@@ -285,6 +299,7 @@ def _passing_sweep_result(**overrides: object) -> SweepResult:
         bitrate_mbps=4000.0,
         bitrate_override=False,
         preview_enabled=False,
+        repeat=1,
         session_dir="session",
         return_code=0,
         qc_status="pass",
@@ -298,6 +313,7 @@ def _passing_sweep_result(**overrides: object) -> SweepResult:
         queue_capacity=1024,
         queue_fraction=100 / 1024,
         preferred_queue_pass=True,
+        queue_growth_pass=True,
         block_id_gaps=0,
         drop_sum=0,
         metadata_complete=True,
@@ -313,6 +329,11 @@ def _passing_sweep_result(**overrides: object) -> SweepResult:
         pixel_fidelity="lossless",
         lossless_claim=True,
         hardware_fingerprint_sha256="fingerprint",
+        profile_fingerprint_sha256="profile-fingerprint",
+        max_camera_temperature_c=59.0,
+        thermal_pass=True,
+        storage_pass=True,
+        health_pass=True,
         technical_pass=True,
         evidence_ready=True,
         profile_approval_pass=True,
@@ -325,9 +346,13 @@ def _passing_sweep_result(**overrides: object) -> SweepResult:
 
 class ValidationGateTests(unittest.TestCase):
     def test_profile_lock_requires_queue_below_25_percent(self) -> None:
-        passing = _passing_sweep_result()
-        self.assertIn("lock_validated", _profile_lock_recommendation([passing], True, True))
-        high_queue = replace(passing, preferred_queue_pass=False, max_queue_depth=300)
+        passing = [_passing_sweep_result(case_id=f"case-{index}", repeat=index) for index in range(1, 4)]
+        self.assertIn("lock_validated", _profile_lock_recommendation(passing, True, True))
+        self.assertEqual(
+            _profile_lock_recommendation([passing[0]], True, True),
+            "do_not_lock_profile_insufficient_repetitions_at_max_duration",
+        )
+        high_queue = replace(passing[0], preferred_queue_pass=False, max_queue_depth=300)
         self.assertEqual(
             _profile_lock_recommendation([high_queue], True, True),
             "do_not_lock_profile_queue_above_25_percent_margin",
@@ -353,12 +378,48 @@ class ValidationGateTests(unittest.TestCase):
             "do_not_lock_profile_acquisition_or_rollover_failed",
         )
 
+    def test_profile_lock_requires_health_stable_queue_and_repetitions(self) -> None:
+        passing = [_passing_sweep_result(case_id=f"case-{index}") for index in range(3)]
+        unhealthy = replace(passing[0], health_pass=False, thermal_pass=False)
+        self.assertEqual(
+            _profile_lock_recommendation([unhealthy], True, True),
+            "do_not_lock_profile_health_evidence_failed",
+        )
+        growing = replace(passing[0], queue_growth_pass=False)
+        self.assertEqual(
+            _profile_lock_recommendation([growing], True, True),
+            "do_not_lock_profile_writer_backlog_still_growing",
+        )
+
     def test_lock_command_writes_fingerprint_without_mutating_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = ROOT / "configs" / "pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml"
             summary = root / "validation_summary.json"
-            result = _passing_sweep_result(profile_approval_pass=False, experiment_ready=False)
+            cfg = load_config(source, duration_s=1)
+            profile_fingerprint = build_profile_fingerprint(
+                camera_config=asdict(cfg.camera),
+                writer_config=asdict(cfg.writer),
+                recording_profile=asdict(cfg.recording_profile),
+                preview_config=asdict(cfg.preview),
+            )["fingerprint_sha256"]
+            evidence_session = root / "evidence_session"
+            evidence_session.mkdir()
+            (evidence_session / "session.json").write_text(
+                json.dumps({"resolved": {"preview": asdict(cfg.preview)}}),
+                encoding="utf-8",
+            )
+            results = [
+                _passing_sweep_result(
+                    case_id=f"case-{index}",
+                    repeat=index,
+                    session_dir=str(evidence_session),
+                    profile_fingerprint_sha256=profile_fingerprint,
+                    profile_approval_pass=False,
+                    experiment_ready=False,
+                )
+                for index in range(1, 4)
+            ]
             summary.write_text(
                 json.dumps(
                     {
@@ -366,7 +427,8 @@ class ValidationGateTests(unittest.TestCase):
                             "preview_off": "lock_validated_for_this_evidence_fingerprint_preview_off",
                             "preview_on": "no_cases_run",
                         },
-                        "results": [asdict(result)],
+                        "requirements": {"passing_repeats_at_max_duration_required": 3},
+                        "results": [asdict(result) for result in results],
                     }
                 ),
                 encoding="utf-8",
@@ -375,11 +437,68 @@ class ValidationGateTests(unittest.TestCase):
             report = lock_profile_from_summary(source, summary, output, preview_mode="off")
             approval = yaml.safe_load(output.read_text(encoding="utf-8"))["approval"]
             self.assertEqual(approval["evidence_fingerprint_sha256"], "fingerprint")
+            self.assertEqual(approval["profile_fingerprint_sha256"], profile_fingerprint)
+            self.assertEqual(approval["validated_max_duration_s"], 30.0)
             self.assertEqual(report["preview_mode"], "off")
             self.assertEqual(
                 yaml.safe_load(source.read_text(encoding="utf-8"))["approval"]["status"],
                 "requires_hardware_validation",
             )
+
+    def test_preview_on_lock_copies_the_validated_gui_preview_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = ROOT / "configs" / "pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml"
+            cfg = load_config(source, duration_s=1)
+            preview = asdict(cfg.preview)
+            preview.update({"enabled": True, "sink": "shm", "width": 320, "max_fps": 8.0})
+            profile_fingerprint = build_profile_fingerprint(
+                camera_config=asdict(cfg.camera),
+                writer_config=asdict(cfg.writer),
+                recording_profile=asdict(cfg.recording_profile),
+                preview_config=preview,
+            )["fingerprint_sha256"]
+            evidence_session = root / "evidence_session"
+            evidence_session.mkdir()
+            (evidence_session / "session.json").write_text(
+                json.dumps({"resolved": {"preview": preview}}),
+                encoding="utf-8",
+            )
+            results = [
+                replace(
+                    _passing_sweep_result(
+                        case_id=f"preview-on-{index}",
+                        repeat=index,
+                        session_dir=str(evidence_session),
+                        preview_enabled=True,
+                        profile_fingerprint_sha256=profile_fingerprint,
+                    ),
+                    profile_id=cfg.recording_profile.id,
+                    pixel_fidelity=cfg.recording_profile.pixel_fidelity,
+                    lossless_claim=False,
+                )
+                for index in range(1, 4)
+            ]
+            summary = root / "validation_summary.json"
+            summary.write_text(
+                json.dumps(
+                    {
+                        "profile_lock_by_preview_mode": {
+                            "preview_on": "lock_validated_for_this_evidence_fingerprint_preview_on"
+                        },
+                        "requirements": {"passing_repeats_at_max_duration_required": 3},
+                        "results": [asdict(result) for result in results],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = root / "approved-preview-on.yaml"
+            lock_profile_from_summary(source, summary, output, preview_mode="on")
+            approved_preview = yaml.safe_load(output.read_text(encoding="utf-8"))["preview"]
+            self.assertTrue(approved_preview["enabled"])
+            self.assertEqual(approved_preview["sink"], "shm")
+            self.assertEqual(approved_preview["width"], 320)
+            self.assertEqual(approved_preview["max_fps"], 8.0)
 
 
 class PreviewTests(unittest.TestCase):
@@ -447,10 +566,99 @@ class PackagingAndEstimateTests(unittest.TestCase):
         self.assertGreaterEqual(estimated_mb, 195)
         self.assertLessEqual(estimated_mb, 210)
 
+    def test_cxp_qualification_plan_is_explicit_about_storage(self) -> None:
+        plan = build_qualification_plan(
+            ROOT / "configs" / "pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml"
+        )
+        self.assertEqual(plan["required_repetitions_at_max_duration"], 3)
+        self.assertEqual(plan["validated_max_duration_s_if_all_pass"], 60)
+        self.assertEqual(plan["estimated_total_decimal_gb"], 135.0)
+        self.assertIn("--required-passing-repeats 3", plan["powershell_command"])
+
+    def test_lossy_qualification_requires_bound_task_quality_record(self) -> None:
+        cfg = load_config(
+            ROOT / "configs" / "pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml",
+            duration_s=1,
+        )
+        missing = load_task_quality_record(
+            None,
+            profile_id=cfg.recording_profile.id,
+            profile_version=cfg.recording_profile.version,
+            required=True,
+        )
+        self.assertFalse(missing["pass"])
+        plan = build_qualification_plan(
+            ROOT / "configs" / "pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml"
+        )
+        self.assertTrue(plan["task_quality_record_required"])
+        self.assertEqual(plan["preview_sink"], "shm")
+        self.assertIn("--task-quality-record", plan["powershell_command"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            record_path = Path(tmp) / "task-quality.json"
+            record = {
+                "schema_version": 1,
+                "profile_id": cfg.recording_profile.id,
+                "profile_version": cfg.recording_profile.version,
+                "status": "pass",
+                "reference_dataset_sha256": "a" * 64,
+                "acceptance_criteria": {"event_f1_min": 0.95},
+                "metrics": {"event_f1": 0.97},
+                "evaluated_utc": "2026-08-14T12:00:00Z",
+            }
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            accepted = load_task_quality_record(
+                record_path,
+                profile_id=cfg.recording_profile.id,
+                profile_version=cfg.recording_profile.version,
+                required=True,
+            )
+            self.assertTrue(accepted["pass"])
+            record["evaluated_utc"] = "2026-08-14T12:00:00"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            rejected = load_task_quality_record(
+                record_path,
+                profile_id=cfg.recording_profile.id,
+                profile_version=cfg.recording_profile.version,
+                required=True,
+            )
+            self.assertFalse(rejected["pass"])
+
+    def test_preview_on_qualification_uses_the_gui_shared_memory_sink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = root / "runtime.yaml"
+            case = SweepCase(
+                case_id="preview_on",
+                duration_s=30.0,
+                bitrate_mbps=27.0,
+                bitrate_override=False,
+                preview_enabled=True,
+                preview_width=320,
+                preview_fps=8.0,
+                repeat=1,
+                segment_seconds=15.0,
+            )
+            _write_runtime_config(
+                ROOT / "configs" / "pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml",
+                runtime,
+                case,
+                root / "sessions",
+                source_frame_hash_every=0,
+                source_frame_hash_max_frames=0,
+            )
+            preview = yaml.safe_load(runtime.read_text(encoding="utf-8"))["preview"]
+            self.assertEqual(preview["sink"], "shm")
+            self.assertEqual(preview["width"], 320)
+            self.assertEqual(preview["max_fps"], 8.0)
+            self.assertTrue(Path(preview["image_path"]).is_absolute())
+
     def test_wheel_declares_camera_configs_and_pfs_resources(self) -> None:
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         data_files = pyproject["tool"]["setuptools"]["data-files"]
-        self.assertEqual(data_files["share/pycamrec/configs"], ["configs/*.yaml"])
+        packaged_configs = data_files["share/pycamrec/configs"]
+        self.assertEqual(len(packaged_configs), 6)
+        self.assertNotIn("configs/*.yaml", packaged_configs)
         self.assertEqual(len(data_files["share/pycamrec"]), 3)
 
     def test_disk_estimate_uses_camera_config_override_before_profile_default(self) -> None:
@@ -482,29 +690,151 @@ class PackagingAndEstimateTests(unittest.TestCase):
         approval = {
             "status": "locked_for_evidence_fingerprint",
             "evidence_fingerprint_sha256": "approved",
+            "profile_fingerprint_sha256": "profile",
+            "validated_max_duration_s": 60,
             "intended_preview_mode": "off",
         }
         self.assertTrue(
             evaluate_profile_approval(
                 approval,
                 evidence_fingerprint_sha256="approved",
+                profile_fingerprint_sha256="profile",
                 preview_enabled=False,
+                duration_s=60,
             )["approved"]
         )
         self.assertFalse(
             evaluate_profile_approval(
                 approval,
                 evidence_fingerprint_sha256="changed",
+                profile_fingerprint_sha256="profile",
                 preview_enabled=False,
+                duration_s=60,
             )["approved"]
         )
         self.assertFalse(
             evaluate_profile_approval(
                 approval,
                 evidence_fingerprint_sha256="approved",
+                profile_fingerprint_sha256="profile",
                 preview_enabled=True,
+                duration_s=60,
             )["approved"]
         )
+        self.assertFalse(
+            evaluate_profile_approval(
+                approval,
+                evidence_fingerprint_sha256="approved",
+                profile_fingerprint_sha256="changed",
+                preview_enabled=False,
+                duration_s=60,
+            )["approved"]
+        )
+        self.assertFalse(
+            evaluate_profile_approval(
+                approval,
+                evidence_fingerprint_sha256="approved",
+                profile_fingerprint_sha256="profile",
+                preview_enabled=False,
+                duration_s=61,
+            )["approved"]
+        )
+
+
+class MetadataAndNamingTests(unittest.TestCase):
+    def test_typed_metadata_validates_weight_pnd_and_custom_fields(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        metadata = ExperimentMetadataConfig(
+            project_id="vision",
+            protocol_id="protocol-1",
+            assay_id="open_field",
+            subject_id="M012",
+            species="mouse",
+            date_of_birth=today.isoformat(),
+            postnatal_day=0,
+            postnatal_day_source="derived_from_date_of_birth",
+            weight_g=24.3,
+            genotype="wt",
+            experimental_group="control",
+            sex="female",
+            experimenter_id="ms",
+            custom_fields={
+                "arena_id": {"value": "A03", "value_type": "string"},
+                "lighting_lux": {"value": 120, "value_type": "integer", "unit": "lux"},
+            },
+        )
+        self.assertEqual(metadata.missing_fields(), [])
+        self.assertEqual(metadata.validation_issues(recording_date=today), [])
+        invalid = replace(metadata, weight_g=-1, postnatal_day=1)
+        self.assertTrue(any("weight_g" in issue for issue in invalid.validation_issues(recording_date=today)))
+        self.assertTrue(any("does not match" in issue for issue in invalid.validation_issues(recording_date=today)))
+
+    def test_session_names_are_stable_friendly_and_recursively_indexed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pfs = root / "camera_12345678.pfs"
+            pfs.write_text("Width\t8\nHeight\t8\nPixelFormat\tMono8\n", encoding="utf-8")
+            experiment = ExperimentMetadataConfig(
+                project_id="Social Vision",
+                protocol_id="P-1",
+                assay_id="Open Field",
+                subject_id="Mouse 012",
+                species="mouse",
+                postnatal_day=22,
+                weight_g=24.3,
+                genotype="wt",
+                experimental_group="control",
+                sex="female",
+                experimenter_id="ms",
+                custom_fields={"arena_id": {"value": "A03", "value_type": "string"}},
+            )
+            cfg = PyCamRecConfig(
+                session=SessionConfig(output_root=root / "sessions", duration_s=1),
+                camera=CameraConfig(
+                    make="basler",
+                    serial="12345678",
+                    pfs_path=pfs,
+                    expected_width=8,
+                    expected_height=8,
+                    expected_pixel_format="Mono8",
+                    expected_fps=10,
+                ),
+                writer=WriterConfig(expected_bitrate_mbps=1),
+                recording_profile=RecordingProfileConfig(id="test", pixel_fidelity="lossy"),
+                experiment=experiment,
+            )
+            preflight = PreflightReport(
+                pfs_sha256="pfs",
+                pfs_features={},
+                raw_bytes_per_second=640,
+                raw_bytes_total=640,
+                estimated_output_bytes=125000,
+                estimated_capacity_s_at_target_rate=100,
+                output_free_bytes=10**9,
+                ffmpeg_version="test",
+                warnings=(),
+            )
+            writer = MetadataWriter(
+                cfg,
+                preflight,
+                {"serial": "12345678", "device_temperature_c": 30},
+                evidence_fingerprint={"fingerprint_sha256": "hardware", "payload": {}},
+                profile_fingerprint={"fingerprint_sha256": "profile", "payload": {}},
+            )
+            writer.close(summary={"frames_written": 0})
+            relative = writer.session_dir.relative_to(cfg.session.output_root.resolve())
+            self.assertEqual(relative.parts[0], "project-social-vision")
+            self.assertEqual(relative.parts[1], "subject-mouse-012")
+            self.assertIn("__task-open-field__run-001__sid-", relative.parts[-1])
+            self.assertEqual(discover_session_dirs(cfg.session.output_root), [writer.session_dir])
+            output = root / "sessions.csv"
+            report = write_session_index(cfg.session.output_root, output)
+            self.assertEqual(report["session_count"], 1)
+            with output.open("r", newline="", encoding="utf-8-sig") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["subject_id"], "Mouse 012")
+            self.assertEqual(row["weight_g"], "24.3")
+            self.assertEqual(row["custom__arena_id"], "A03")
 
 
 class WriterIntegrationTests(unittest.TestCase):
