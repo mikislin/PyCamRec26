@@ -99,7 +99,7 @@ BslMultipleROIRowOffset	2064
 BslMultipleROIRowSelector	Row8
 BslMultipleROIRowOffset	2064
 BslMultipleROIRowSelector	Row1
-BslAcquisitionStopMode	AbortExposure
+BslAcquisitionStopMode	CompleteExposure
 ExposureTimeSelector	Common
 ExposureTime	2500.0
 ExposureTimeSelector	Common

@@ -102,7 +102,7 @@ class FfmpegSegmentWriter:
             stdout=subprocess.PIPE if self.cfg.writer.spool_output else subprocess.DEVNULL,
             creationflags=_creationflags(),
         )
-        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, args=(self.process,), daemon=True)
         self._stderr_thread.start()
         if self.cfg.writer.spool_output:
             if self.process.stdout is None:
@@ -111,12 +111,13 @@ class FfmpegSegmentWriter:
             self._spool_queue = queue.Queue(maxsize=max_chunks)
             self._spool_writer_thread = threading.Thread(
                 target=self._write_spooled_stdout_to_disk,
-                args=(temp_path,),
+                args=(temp_path, self.process),
                 daemon=True,
                 name="pycamrec-spool-writer",
             )
             self._stdout_thread = threading.Thread(
                 target=self._drain_stdout_to_spool,
+                args=(self.process,),
                 daemon=True,
                 name="pycamrec-ffmpeg-stdout",
             )
@@ -131,12 +132,13 @@ class FfmpegSegmentWriter:
         if process.stdin is not None:
             process.stdin.close()
         try:
-            exit_code = process.wait(timeout=1800 if self.cfg.writer.spool_output else 60)
+            exit_code = process.wait(timeout=self.cfg.writer.finalize_timeout_s)
         except subprocess.TimeoutExpired as exc:
             process.kill()
             tail = "\n".join(self.stderr_lines[-20:])
             raise RuntimeError(
-                f"FFmpeg segment {self.segment_id} did not finish cleanly before timeout:\n{tail}"
+                f"FFmpeg segment {self.segment_id} did not finish cleanly before "
+                f"{self.cfg.writer.finalize_timeout_s:g}s timeout:\n{tail}"
             ) from exc
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=2)
@@ -148,6 +150,13 @@ class FfmpegSegmentWriter:
             self._spool_writer_thread.join(timeout=1800)
             if self._spool_writer_thread.is_alive():
                 self._spool_errors.append("Timed out writing RAM spool to disk.")
+        if process.stderr is not None:
+            process.stderr.close()
+        if process.stdout is not None:
+            process.stdout.close()
+        self._stderr_thread = None
+        self._stdout_thread = None
+        self._spool_writer_thread = None
         if exit_code != 0:
             tail = "\n".join(self.stderr_lines[-20:])
             raise RuntimeError(f"FFmpeg segment {self.segment_id} failed with code {exit_code}:\n{tail}")
@@ -217,9 +226,8 @@ class FfmpegSegmentWriter:
             output_args = output_args + ["-f", self.cfg.writer.container]
         return base + output_args + [str(output_path)]
 
-    def _drain_stderr(self) -> None:
-        process = self.process
-        if process is None or process.stderr is None:
+    def _drain_stderr(self, process: subprocess.Popen[bytes]) -> None:
+        if process.stderr is None:
             return
         for raw in iter(process.stderr.readline, b""):
             try:
@@ -227,10 +235,9 @@ class FfmpegSegmentWriter:
             except Exception:
                 self.stderr_lines.append(repr(raw))
 
-    def _drain_stdout_to_spool(self) -> None:
-        process = self.process
+    def _drain_stdout_to_spool(self, process: subprocess.Popen[bytes]) -> None:
         spool_queue = self._spool_queue
-        if process is None or process.stdout is None or spool_queue is None:
+        if process.stdout is None or spool_queue is None:
             return
         try:
             while True:
@@ -251,7 +258,11 @@ class FfmpegSegmentWriter:
                         self._spool_errors.append("Unable to signal spool writer because it stopped early.")
                         break
 
-    def _write_spooled_stdout_to_disk(self, temp_path: Path) -> None:
+    def _write_spooled_stdout_to_disk(
+        self,
+        temp_path: Path,
+        process: subprocess.Popen[bytes],
+    ) -> None:
         spool_queue = self._spool_queue
         if spool_queue is None:
             return
@@ -268,8 +279,7 @@ class FfmpegSegmentWriter:
                         spool_queue.task_done()
         except BaseException as exc:
             self._spool_errors.append(repr(exc))
-            process = self.process
-            if process is not None and process.poll() is None:
+            if process.poll() is None:
                 process.kill()
 
     def _record_spool_enqueue(self, byte_count: int) -> None:

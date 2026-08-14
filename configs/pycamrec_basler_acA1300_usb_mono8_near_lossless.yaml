@@ -1,0 +1,55 @@
+config_schema_version: 2
+profile: near_lossless_h264_400m
+session:
+  output_root: D:/PyCamRecSessions
+  name: acA1300_usb_mono8_near_lossless
+  operator: ""
+  notes: Full-frame Mono8 high-quality MP4 at the current 80 fps PFS rate; pixels are lossy.
+camera:
+  make: basler_usb
+  serial: "24188001"
+  pfs_path: ../acA1300-200uc_24188001_mono8.pfs
+  expected_width: 1280
+  expected_height: 1024
+  expected_pixel_format: Mono8
+  expected_fps: 80.0
+  grab_timeout_ms: 2000
+  max_num_buffer: 512
+  enable_chunks: true
+  strict_validation: true
+  temperature_warning_c: 45.0
+  health_check_interval_s: 10.0
+writer:
+  segment_seconds: 120
+  expected_bitrate_mbps: 400
+  min_free_space_gb: 30
+  ffmpeg_path: C:/ffmpeg/ffmpeg-2025-09-28-git-0fdb5829e3-full_build/bin/ffmpeg.exe
+  ffprobe_path: C:/ffmpeg/ffmpeg-2025-09-28-git-0fdb5829e3-full_build/bin/ffprobe.exe
+experiment:
+  animal_id: UNSPECIFIED
+  dob: UNSPECIFIED
+  test_assay_name: UNSPECIFIED
+  genotype: UNSPECIFIED
+  experimental_group: UNSPECIFIED
+  sex: UNSPECIFIED
+  experimentator: UNSPECIFIED
+  project_protocol: UNSPECIFIED
+  camera_profile_path: UNSPECIFIED
+  notes: ""
+metadata:
+  per_frame_format: csv
+  flush_every_frames: 200
+  record_host_timestamps: true
+preview:
+  enabled: false
+  max_fps: 10.0
+  width: 512
+  overlay: true
+  shed_queue_fraction: 0.10
+  shed_fps_ratio: 0.99
+  throttle_cooldown_s: 2.0
+  opencv_threads: 1
+approval:
+  status: requires_hardware_validation
+  intended_preview_mode: off
+  evidence_fingerprint_sha256: ""

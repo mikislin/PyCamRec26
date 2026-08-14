@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from . import __release_stage__, __version__
+from .hardware import build_hardware_fingerprint
+from .pixel_formats import channel_semantics
 from .preflight import PreflightReport, sha256_file
 from .schemas import PyCamRecConfig
 
@@ -31,6 +33,7 @@ class FrameMetadata:
     queue_depth_after_enqueue: int
     writer_segment_id: int
     dropped_before_frame: int
+    source_framemd5: str = ""
     status: str = "grabbed"
     error: str = ""
 
@@ -55,10 +58,20 @@ class MetadataWriter:
     tail of the timing record.
     """
 
-    def __init__(self, cfg: PyCamRecConfig, preflight: PreflightReport, device_info: dict[str, Any]):
+    def __init__(
+        self,
+        cfg: PyCamRecConfig,
+        preflight: PreflightReport,
+        device_info: dict[str, Any],
+        *,
+        evidence_fingerprint: dict[str, Any] | None = None,
+        profile_approval: dict[str, Any] | None = None,
+    ):
         self.cfg = cfg
         self.preflight = preflight
         self.device_info = device_info
+        self._evidence_fingerprint = evidence_fingerprint
+        self._profile_approval = profile_approval or {}
         self.session_dir = self._make_session_dir()
         self.segments_dir = self.session_dir / "segments"
         self.segments_dir.mkdir(parents=True, exist_ok=False)
@@ -67,12 +80,14 @@ class MetadataWriter:
         self.segments_path = self.session_dir / "segments.csv"
         self.events_path = self.session_dir / "events.jsonl"
         self.experiment_metadata_path = self.session_dir / "experiment_metadata.json"
+        self.analysis_manifest_path = self.session_dir / "analysis_manifest.json"
         self._frame_count_since_flush = 0
         self._closed = False
 
         self._copy_inputs()
         self._write_session_json()
         self._write_experiment_metadata_json()
+        self._write_analysis_manifest_json()
 
         self._frames_file = self.frames_path.open("w", newline="", encoding="utf-8")
         self._frames_csv = csv.DictWriter(
@@ -120,6 +135,7 @@ class MetadataWriter:
         if summary:
             self.log_event("session_summary", summary)
             self._write_experiment_metadata_json(summary=summary)
+            self._write_analysis_manifest_json(summary=summary)
         self.flush()
         self._frames_file.close()
         self._segments_file.close()
@@ -141,6 +157,7 @@ class MetadataWriter:
         shutil.copy2(self.cfg.camera.pfs_path, self.session_dir / self.cfg.camera.pfs_path.name)
 
     def _write_session_json(self) -> None:
+        hardware_fingerprint = self._hardware_fingerprint()
         session_doc = {
             "schema_version": 1,
             "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -157,6 +174,8 @@ class MetadataWriter:
             },
             "preflight": _jsonable(asdict(self.preflight)),
             "device_info": _jsonable(self.device_info),
+            "hardware_fingerprint": _jsonable(hardware_fingerprint),
+            "profile_approval": _jsonable(self._profile_approval),
             "pfs_sha256_verified": sha256_file(self.cfg.camera.pfs_path),
             "experiment_metadata": self._experiment_metadata_document(),
         }
@@ -172,10 +191,57 @@ class MetadataWriter:
             encoding="utf-8",
         )
 
+    def _write_analysis_manifest_json(self, summary: dict[str, Any] | None = None) -> None:
+        pixel_format = self.cfg.camera.expected_pixel_format
+        semantics = channel_semantics(pixel_format)
+        preferred_mode = "gray"
+        if semantics.startswith("raw_bayer"):
+            preferred_mode = "raw_bayer_or_debayer_export"
+        elif semantics in {"rgb", "bgr"}:
+            preferred_mode = "color"
+        document = {
+            "schema_version": 1,
+            "session_directory": str(self.session_dir),
+            "camera": {
+                "serial": self.cfg.camera.serial,
+                "width": self.cfg.camera.expected_width,
+                "height": self.cfg.camera.expected_height,
+                "fps": self.cfg.camera.expected_fps,
+                "pixel_format": pixel_format,
+                "channel_semantics": semantics,
+            },
+            "video_storage": {
+                "container": self.cfg.writer.container,
+                "input_pix_fmt": self.cfg.writer.input_pix_fmt,
+                "output_pix_fmt": self.cfg.writer.output_pix_fmt,
+                "codec": self.cfg.writer.codec,
+                "profile_id": self.cfg.recording_profile.id,
+                "pixel_fidelity": self.cfg.recording_profile.pixel_fidelity,
+            },
+            "analysis_recommendations": {
+                "preferred_mode": preferred_mode,
+                "opencv_set_cap_prop_convert_rgb_false": semantics.startswith("mono") or semantics.startswith("raw_bayer"),
+                "mono_note": (
+                    "Many MP4/AVI readers expose grayscale video as RGB/BGR with identical channels. "
+                    "Use the luma plane or disable RGB conversion when the source is Mono8."
+                ),
+                "bayer_note": (
+                    "Bayer recordings store the raw mosaic. Use export-analysis --mode debayer "
+                    "or a controlled offline debayer step before color analysis."
+                ),
+            },
+            "recording_summary": summary or {},
+        }
+        self.analysis_manifest_path.write_text(
+            json.dumps(document, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+
     def _experiment_metadata_document(self, summary: dict[str, Any] | None = None) -> dict[str, Any]:
         disk_usage = shutil.disk_usage(self.session_dir)
         experiment = asdict(self.cfg.experiment)
         missing_fields = self.cfg.experiment.missing_fields()
+        hardware_fingerprint = self._hardware_fingerprint()
         automatic: dict[str, Any] = {
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "session_directory": str(self.session_dir),
@@ -186,6 +252,8 @@ class MetadataWriter:
             "device_info": self.device_info,
             "camera_profile_path_resolved": str(self.cfg.camera.pfs_path),
             "pfs_sha256": self.preflight.pfs_sha256,
+            "hardware_fingerprint_sha256": hardware_fingerprint["fingerprint_sha256"],
+            "profile_approval": _jsonable(self._profile_approval),
             "camera_settings": {
                 "exposure_time": self.device_info.get("exposure_time"),
                 "gain": self.device_info.get("gain"),
@@ -200,6 +268,8 @@ class MetadataWriter:
                 "output_root": str(self.cfg.session.output_root),
                 "session_path": str(self.session_dir),
                 "preflight_free_bytes": self.preflight.output_free_bytes,
+                "estimated_output_bytes": self.preflight.estimated_output_bytes,
+                "estimated_capacity_s_at_target_rate": self.preflight.estimated_capacity_s_at_target_rate,
                 "current_free_bytes": disk_usage.free,
                 "current_free_gb": round(disk_usage.free / 1024**3, 3),
             },
@@ -220,6 +290,18 @@ class MetadataWriter:
             "automatic": automatic,
         }
 
+    def _hardware_fingerprint(self) -> dict[str, Any]:
+        if self._evidence_fingerprint is None:
+            self._evidence_fingerprint = build_hardware_fingerprint(
+                camera_config=asdict(self.cfg.camera),
+                device_info=self.device_info,
+                pfs_sha256=self.preflight.pfs_sha256,
+                ffmpeg_path=self.cfg.writer.ffmpeg_path,
+                ffprobe_path=self.cfg.writer.ffprobe_path,
+                ffmpeg_version=self.preflight.ffmpeg_version,
+            )
+        return self._evidence_fingerprint
+
 
 def _software_info() -> dict[str, Any]:
     return {
@@ -234,7 +316,7 @@ def _software_info() -> dict[str, Any]:
 def _git_value(*args: str) -> str | None:
     try:
         completed = subprocess.run(
-            ["git", "-C", str(Path(__file__).resolve().parents[1]), *args],
+            ["git", "-c", "safe.directory=*", "-C", str(Path(__file__).resolve().parents[1]), *args],
             check=True,
             capture_output=True,
             text=True,
@@ -249,7 +331,7 @@ def _git_value(*args: str) -> str | None:
 def _git_dirty() -> bool | None:
     try:
         completed = subprocess.run(
-            ["git", "-C", str(Path(__file__).resolve().parents[1]), "status", "--porcelain"],
+            ["git", "-c", "safe.directory=*", "-C", str(Path(__file__).resolve().parents[1]), "status", "--porcelain"],
             check=True,
             capture_output=True,
             text=True,

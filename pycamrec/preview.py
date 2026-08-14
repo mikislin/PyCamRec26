@@ -8,6 +8,7 @@ keep up, older preview frames are overwritten silently.
 from __future__ import annotations
 
 import shutil
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Any, Callable
 
+from .pixel_formats import bytes_per_pixel, channel_semantics, normalize_pixel_format
 from .schemas import PreviewConfig
 
 
@@ -40,6 +42,7 @@ class PreviewWorker:
         source_width: int,
         source_height: int,
         source_fps: float,
+        source_pixel_format: str,
         queue_max_frames: int,
         session_dir: Path,
         recording_profile_id: str,
@@ -49,6 +52,7 @@ class PreviewWorker:
         self.source_width = source_width
         self.source_height = source_height
         self.source_fps = source_fps
+        self.source_pixel_format = source_pixel_format
         self.queue_max_frames = queue_max_frames
         self.session_dir = session_dir
         self.recording_profile_id = recording_profile_id
@@ -58,6 +62,9 @@ class PreviewWorker:
         self.frames_published = 0
         self.frames_displayed = 0
         self.frames_dropped = 0
+        self.frames_shed_queue = 0
+        self.frames_shed_fps = 0
+        self.throttle_events = 0
         self.error: str = ""
 
         self._lock = threading.Lock()
@@ -71,8 +78,11 @@ class PreviewWorker:
         self._pgm_ring_size = 64
         self._numpy: Any | None = None
         self._shm: shared_memory.SharedMemory | None = None
-        self._shm_shape: tuple[int, int] | None = None
+        self._shm_shape: tuple[int, int, int] | None = None
         self._shm_sequence = 0
+        self._throttled_until = 0.0
+        self._fps_window_elapsed_s: float | None = None
+        self._fps_window_frame_count: int | None = None
 
     def start(self) -> bool:
         if not self.cfg.enabled:
@@ -121,8 +131,14 @@ class PreviewWorker:
             return
         if frame_index % self.sample_every != 0:
             return
-        if queue_depth >= int(self.queue_max_frames * 0.90):
+        shed_reason = self._shed_reason(queue_depth)
+        if shed_reason == "queue":
             self.frames_dropped += 1
+            self.frames_shed_queue += 1
+            return
+        if shed_reason == "fps":
+            self.frames_dropped += 1
+            self.frames_shed_fps += 1
             return
         with self._lock:
             if self._latest_frame is not None:
@@ -154,15 +170,27 @@ class PreviewWorker:
             "target_width": self.cfg.width,
             "target_height": self.cfg.height,
             "target_fps": self.cfg.max_fps,
+            "source_pixel_format": self.source_pixel_format,
+            "channel_semantics": channel_semantics(self.source_pixel_format),
             "frames_published": self.frames_published,
             "frames_displayed": self.frames_displayed,
             "frames_dropped": self.frames_dropped,
+            "frames_shed_queue": self.frames_shed_queue,
+            "frames_shed_fps": self.frames_shed_fps,
+            "adaptive_throttle_events": self.throttle_events,
+            "shed_queue_fraction": self.cfg.shed_queue_fraction,
+            "shed_fps_ratio": self.cfg.shed_fps_ratio,
             "error": self.error,
         }
 
     def _run(self) -> None:
         import cv2
         import numpy as np
+
+        try:
+            cv2.setNumThreads(self.cfg.opencv_threads)
+        except Exception:
+            pass
 
         if self.cfg.sink == "file":
             assert self.cfg.image_path is not None
@@ -188,15 +216,14 @@ class PreviewWorker:
                     self._frame_ready.wait(timeout=0.1)
                     continue
 
-                image = np.frombuffer(frame.frame_bytes, dtype=np.uint8).reshape(
-                    self.source_height,
-                    self.source_width,
-                )
+                image = self._frame_array(np, frame.frame_bytes)
                 display = cv2.resize(
                     image,
                     (target_width, target_height),
                     interpolation=cv2.INTER_AREA,
                 )
+                if self._source_pixel_format_normalized() == "rgb8":
+                    display = cv2.cvtColor(display, cv2.COLOR_RGB2BGR)
                 if self.cfg.overlay:
                     display = self._add_overlay(cv2, display, frame)
 
@@ -288,8 +315,51 @@ class PreviewWorker:
             self._frame_ready.clear()
             return frame
 
-    def _add_overlay(self, cv2: Any, gray_display: Any, frame: PreviewFrame) -> Any:
-        display = cv2.cvtColor(gray_display, cv2.COLOR_GRAY2BGR)
+    def _shed_reason(self, queue_depth: int) -> str:
+        """Shed preview before capture reaches a scientifically risky state."""
+
+        queue_limit = max(1, math.ceil(self.queue_max_frames * self.cfg.shed_queue_fraction))
+        if queue_depth >= queue_limit:
+            return "queue"
+        metrics = self.metrics_provider()
+        if str(metrics.get("status") or "").strip().upper() == "PREVIEW":
+            # Setup preview has no writer queue to protect. Suppressing its only
+            # output because camera startup lowered a cumulative rate makes the
+            # GUI appear frozen and provides no acquisition-safety benefit.
+            return ""
+        now = time.perf_counter()
+        if now < self._throttled_until:
+            return "fps"
+        elapsed_s = float(metrics.get("elapsed_s") or 0.0)
+        frames_grabbed = int(metrics.get("frames_grabbed") or 0)
+        expected_fps = float(metrics.get("expected_fps") or self.source_fps)
+        if (
+            self._fps_window_elapsed_s is None
+            or self._fps_window_frame_count is None
+            or elapsed_s < self._fps_window_elapsed_s
+            or frames_grabbed < self._fps_window_frame_count
+        ):
+            self._fps_window_elapsed_s = elapsed_s
+            self._fps_window_frame_count = frames_grabbed
+            return ""
+        window_s = elapsed_s - self._fps_window_elapsed_s
+        if window_s < 2.0 or expected_fps <= 0:
+            return ""
+        frame_delta = frames_grabbed - self._fps_window_frame_count
+        observed_fps = frame_delta / window_s
+        self._fps_window_elapsed_s = elapsed_s
+        self._fps_window_frame_count = frames_grabbed
+        if observed_fps < expected_fps * self.cfg.shed_fps_ratio:
+            self._throttled_until = now + self.cfg.throttle_cooldown_s
+            self.throttle_events += 1
+            return "fps"
+        return ""
+
+    def _add_overlay(self, cv2: Any, display_image: Any, frame: PreviewFrame) -> Any:
+        if len(display_image.shape) == 2:
+            display = cv2.cvtColor(display_image, cv2.COLOR_GRAY2BGR)
+        else:
+            display = display_image.copy()
         overlay = display.copy()
         cv2.rectangle(overlay, (0, 0), (display.shape[1], 92), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
@@ -395,6 +465,8 @@ class PreviewWorker:
             "preview_height": output_height,
             "source_width": self.source_width,
             "source_height": self.source_height,
+            "source_pixel_format": self.source_pixel_format,
+            "channel_semantics": channel_semantics(self.source_pixel_format),
             "downsample_stride": stride,
             "writer_segment_id": frame.writer_segment_id,
             "queue_depth": frame.queue_depth,
@@ -436,18 +508,15 @@ class PreviewWorker:
             if self.cfg.sink == "shm_raw":
                 buffer_width = self.source_width
                 buffer_height = self.source_height
-                buffer_format = "raw_mono8"
-            self._ensure_shm(buffer_width, buffer_height)
+                buffer_format = self._raw_buffer_format()
+            self._ensure_shm(buffer_width, buffer_height, bytes_per_pixel=self._buffer_bytes_per_pixel(buffer_format))
             assert self._shm is not None
             if self.cfg.sink == "shm_raw":
                 start = SHM_HEADER_BYTES
                 end = start + len(frame.frame_bytes)
                 self._shm.buf[start:end] = frame.frame_bytes
             elif self._numpy is not None:
-                source = self._numpy.frombuffer(frame.frame_bytes, dtype=self._numpy.uint8).reshape(
-                    self.source_height,
-                    self.source_width,
-                )
+                source = self._preview_gray_array(self._numpy, frame.frame_bytes)
                 target = self._numpy.ndarray(
                     (output_height, output_width),
                     dtype=self._numpy.uint8,
@@ -478,6 +547,8 @@ class PreviewWorker:
             "buffer_format": buffer_format,
             "source_width": self.source_width,
             "source_height": self.source_height,
+            "source_pixel_format": self.source_pixel_format,
+            "channel_semantics": channel_semantics(self.source_pixel_format),
             "downsample_stride": stride,
             "frame_index": frame.frame_index,
             "writer_segment_id": frame.writer_segment_id,
@@ -504,15 +575,14 @@ class PreviewWorker:
         return max(width_stride, height_stride)
 
     def _pgm_payload(self, frame_bytes: bytes, stride: int) -> bytes:
-        if stride == 1:
+        if stride == 1 and self._source_bytes_per_pixel() == 1:
             return frame_bytes
         if self._numpy is not None:
-            image = self._numpy.frombuffer(frame_bytes, dtype=self._numpy.uint8).reshape(
-                self.source_height,
-                self.source_width,
-            )
+            image = self._preview_gray_array(self._numpy, frame_bytes)
             return image[::stride, ::stride].copy(order="C").tobytes()
 
+        if self._source_bytes_per_pixel() != 1:
+            raise RuntimeError("Numpy is required for color preview downsampling.")
         view = memoryview(frame_bytes)
         rows: list[bytes] = []
         for y in range(0, self.source_height, stride):
@@ -529,12 +599,12 @@ class PreviewWorker:
             f"{self.cfg.image_path.stem}_{slot:02d}{self.cfg.image_path.suffix}"
         )
 
-    def _ensure_shm(self, width: int, height: int) -> None:
-        shape = (height, width)
+    def _ensure_shm(self, width: int, height: int, *, bytes_per_pixel: int = 1) -> None:
+        shape = (height, width, bytes_per_pixel)
         if self._shm is not None and self._shm_shape == shape:
             return
         self._close_shm()
-        size = SHM_HEADER_BYTES + width * height
+        size = SHM_HEADER_BYTES + width * height * bytes_per_pixel
         base_name = f"pycamrec_preview_{time.time_ns()}"
         for index in range(100):
             name = base_name if index == 0 else f"{base_name}_{index}"
@@ -589,6 +659,8 @@ class PreviewWorker:
                 "preview_height": height,
                 "source_width": self.source_width,
                 "source_height": self.source_height,
+                "source_pixel_format": self.source_pixel_format,
+                "channel_semantics": channel_semantics(self.source_pixel_format),
                 "sequence": 0,
             }
         )
@@ -604,6 +676,56 @@ class PreviewWorker:
         except Exception:
             return False
         return True
+
+    def _source_pixel_format_normalized(self) -> str:
+        return normalize_pixel_format(self.source_pixel_format)
+
+    def _source_bytes_per_pixel(self) -> int:
+        return bytes_per_pixel(self.source_pixel_format)
+
+    def _raw_buffer_format(self) -> str:
+        normalized = self._source_pixel_format_normalized()
+        if normalized == "mono8":
+            return "raw_mono8"
+        if normalized.startswith("bayer"):
+            return "raw_bayer8"
+        if normalized == "rgb8":
+            return "raw_rgb8"
+        if normalized == "bgr8":
+            return "raw_bgr8"
+        return f"raw_{normalized}"
+
+    def _buffer_bytes_per_pixel(self, buffer_format: str) -> int:
+        if buffer_format in {"raw_rgb8", "raw_bgr8"}:
+            return 3
+        return 1
+
+    def _frame_array(self, np: Any, frame_bytes: bytes) -> Any:
+        if self._source_bytes_per_pixel() == 3:
+            return np.frombuffer(frame_bytes, dtype=np.uint8).reshape(
+                self.source_height,
+                self.source_width,
+                3,
+            )
+        return np.frombuffer(frame_bytes, dtype=np.uint8).reshape(
+            self.source_height,
+            self.source_width,
+        )
+
+    def _preview_gray_array(self, np: Any, frame_bytes: bytes) -> Any:
+        image = self._frame_array(np, frame_bytes)
+        if len(image.shape) == 2:
+            return image
+        normalized = self._source_pixel_format_normalized()
+        if normalized == "rgb8":
+            red = image[:, :, 0].astype(np.uint16)
+            green = image[:, :, 1].astype(np.uint16)
+            blue = image[:, :, 2].astype(np.uint16)
+        else:
+            blue = image[:, :, 0].astype(np.uint16)
+            green = image[:, :, 1].astype(np.uint16)
+            red = image[:, :, 2].astype(np.uint16)
+        return ((77 * red + 150 * green + 29 * blue) >> 8).astype(np.uint8)
 
 
 def format_duration(seconds: float) -> str:

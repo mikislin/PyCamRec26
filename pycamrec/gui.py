@@ -24,30 +24,55 @@ from typing import Any
 
 from . import __release_stage__, __version__
 from .config import load_config
-from .preflight import run_preflight
+from .onboarding import generate_camera_config
+from .pixel_formats import is_bayer_pixel_format as is_bayer_camera_pixel_format
+from .pixel_formats import is_mono_pixel_format, is_rgb_pixel_format
+from .preflight import parse_pfs_features, run_preflight
 from .report import build_session_report
 
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_DIR = WORKSPACE_ROOT / "configs"
+MODULE_PARENT = Path(__file__).resolve().parents[1]
+SOURCE_CHECKOUT = (MODULE_PARENT / "pyproject.toml").is_file()
+WORKSPACE_ROOT = MODULE_PARENT if SOURCE_CHECKOUT else Path.cwd().resolve()
+RESOURCE_ROOT = MODULE_PARENT if SOURCE_CHECKOUT else Path(sys.prefix) / "share" / "pycamrec"
+CONFIG_DIR = RESOURCE_ROOT / "configs"
+USER_DATA_ROOT = (
+    WORKSPACE_ROOT
+    if SOURCE_CHECKOUT
+    else Path(os.environ.get("LOCALAPPDATA") or WORKSPACE_ROOT) / "PyCamRec"
+)
+GENERATED_CONFIG_DIR = CONFIG_DIR / "generated" if SOURCE_CHECKOUT else USER_DATA_ROOT / "configs" / "generated"
 DEFAULT_OUTPUT_ROOT = Path("D:/PyCamRecSessions")
-RUNTIME_DIR = WORKSPACE_ROOT / ".pycamrec_gui"
+RUNTIME_DIR = WORKSPACE_ROOT / ".pycamrec_gui" if SOURCE_CHECKOUT else USER_DATA_ROOT / "runtime"
 PREVIEW_IMAGE_PATH = RUNTIME_DIR / "latest_preview.pgm"
 
 PROFILE_CONFIGS = (
-    CONFIG_DIR / "pycamrec_basler_a2A2448_profile_long_lossy.yaml",
-    CONFIG_DIR / "pycamrec_basler_a2A2448_profile_near_lossless.yaml",
-    CONFIG_DIR / "pycamrec_basler_a2A2448_profile_lossless.yaml",
+    CONFIG_DIR / "pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml",
+    CONFIG_DIR / "pycamrec_basler_a2A2448_cxp_mono8_near_lossless.yaml",
+    CONFIG_DIR / "pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml",
+    CONFIG_DIR / "pycamrec_basler_acA1300_usb_mono8_cv_optimal.yaml",
+    CONFIG_DIR / "pycamrec_basler_acA1300_usb_mono8_near_lossless.yaml",
+    CONFIG_DIR / "pycamrec_basler_acA1300_usb_mono8_lossless.yaml",
 )
 PROFILE_CHOICES = (
-    ("Long", PROFILE_CONFIGS[0]),
-    ("Near-lossless", PROFILE_CONFIGS[1]),
-    ("Lossless calibration", PROFILE_CONFIGS[2]),
+    ("CXP Mono8 CV-optimal (validation required)", PROFILE_CONFIGS[0]),
+    ("CXP Mono8 near-lossless (validation required)", PROFILE_CONFIGS[1]),
+    ("CXP Mono8 lossless (not locked)", PROFILE_CONFIGS[2]),
+    ("USB Mono8 CV-optimal (validation required)", PROFILE_CONFIGS[3]),
+    ("USB Mono8 near-lossless (validation required)", PROFILE_CONFIGS[4]),
+    ("USB Mono8 lossless (validation required)", PROFILE_CONFIGS[5]),
 )
 PROFILE_PATH_BY_LABEL = {label: path for label, path in PROFILE_CHOICES}
 PROFILE_LABELS = tuple(label for label, _path in PROFILE_CHOICES)
 CUSTOM_PROFILE_LABEL = "Custom"
-SCIENTIFIC_PREVIEW_PROFILE_IDS = {"long_lossy_h264_250m", "near_lossless_h264_400m"}
+SCIENTIFIC_PREVIEW_PROFILE_IDS = {
+    "near_lossless_h264_400m",
+    "usb_mono8_lossless_h264_nvenc_mp4",
+    "cxp_mono8_lossless_h264_nvenc_mp4",
+    "analysis_h264_mp4_100m",
+    "analysis_h264_mp4_250m",
+    "analysis_h264_mp4_27m",
+}
 
 METADATA_FIELDS = (
     ("animal_id", "Animal ID"),
@@ -84,8 +109,10 @@ class PyCamRecApp:
         self.ui_queue: thread_queue.Queue[tuple[str, Any]] = thread_queue.Queue()
         self.process: subprocess.Popen[str] | None = None
         self.setup_preview_process: subprocess.Popen[str] | None = None
+        self.validation_process: subprocess.Popen[str] | None = None
         self.reader_thread: threading.Thread | None = None
         self.setup_preview_reader_thread: threading.Thread | None = None
+        self.validation_reader_thread: threading.Thread | None = None
         self.record_started_at: float | None = None
         self.record_progress_elapsed_s: float | None = None
         self.record_progress_wall_at: float | None = None
@@ -106,16 +133,29 @@ class PyCamRecApp:
         self.preview_shm_name = ""
         self.preview_render_slot = 0
         self.preview_numpy: Any | None = None
+        self.preview_cv2: Any | bool | None = None
+        self.onboard_detected_serial = ""
+        self.onboard_detected_capabilities: dict[str, Any] = {}
 
         self.profile_choice_var = tk.StringVar(value=PROFILE_LABELS[0])
         self.config_var = tk.StringVar(value=str(PROFILE_CONFIGS[0]))
         self.camera_profile_var = tk.StringVar(value="")
         self.output_root_var = tk.StringVar(value=str(DEFAULT_OUTPUT_ROOT))
         self.duration_var = tk.StringVar(value="60")
+        self.segment_seconds_var = tk.StringVar(value="")
         self.preview_enabled_var = tk.BooleanVar(value=False)
         self.preview_width_var = tk.StringVar(value="512")
-        self.preview_fps_var = tk.StringVar(value="20")
+        self.preview_fps_var = tk.StringVar(value="10")
+        self.preview_display_mode_var = tk.StringVar(value="Auto")
         self.allow_unspecified_var = tk.BooleanVar(value=False)
+        self.onboard_pixel_format_var = tk.StringVar(value="Mono8")
+        self.onboard_expected_fps_var = tk.StringVar(value="")
+        self.onboard_segment_seconds_var = tk.StringVar(value="120")
+        self.onboard_durations_var = tk.StringVar(value="30")
+        self.onboard_preview_var = tk.StringVar(value="both")
+        self.onboard_hash_every_var = tk.StringVar(value="10")
+        self.onboard_hash_max_var = tk.StringVar(value="100")
+        self.onboard_status_var = tk.StringVar(value="Generate a candidate config, then run evidence validation.")
 
         self.status_var = tk.StringVar(value="Idle")
         self.device_status_var = tk.StringVar(value="Device status not checked")
@@ -146,6 +186,7 @@ class PyCamRecApp:
             "segments": tk.StringVar(value="No report loaded"),
             "temperature": tk.StringVar(value="No report loaded"),
             "metadata": tk.StringVar(value="No report loaded"),
+            "analysis": tk.StringVar(value="No report loaded"),
         }
 
         self.logger, self.app_log_path = _make_app_logger()
@@ -194,6 +235,7 @@ class PyCamRecApp:
         self._build_device_tab()
         self._build_setup_tab()
         self._build_metadata_tab()
+        self._build_validation_tab()
         self._build_reports_tab()
 
         self._build_preview_panel(right_panel)
@@ -226,7 +268,7 @@ class PyCamRecApp:
 
         top = ttk.Frame(frame)
         top.pack(fill=tk.X)
-        ttk.Label(top, text="Camera and CXP transport", style="Header.TLabel").pack(side=tk.LEFT)
+        ttk.Label(top, text="Camera and transport", style="Header.TLabel").pack(side=tk.LEFT)
         ttk.Button(top, text="Refresh devices", command=self.refresh_devices).pack(side=tk.RIGHT)
 
         ttk.Label(frame, textvariable=self.device_status_var, wraplength=500).pack(fill=tk.X, pady=(8, 6))
@@ -263,12 +305,27 @@ class PyCamRecApp:
         ttk.Label(form, text="Duration (s)").grid(row=3, column=0, sticky=tk.W, pady=3)
         ttk.Entry(form, textvariable=self.duration_var, width=14).grid(row=3, column=1, sticky=tk.W, pady=3, padx=(8, 4))
 
-        ttk.Label(form, text="Output root").grid(row=4, column=0, sticky=tk.W, pady=3)
-        ttk.Entry(form, textvariable=self.output_root_var).grid(row=4, column=1, sticky=tk.EW, pady=3, padx=(8, 4))
-        ttk.Button(form, text="Browse", command=self.browse_output_root).grid(row=4, column=2, sticky=tk.EW)
+        ttk.Label(form, text="Segment (s)").grid(row=4, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(form, textvariable=self.segment_seconds_var, width=14).grid(
+            row=4,
+            column=1,
+            sticky=tk.W,
+            pady=3,
+            padx=(8, 4),
+        )
+        ttk.Label(form, text="blank uses profile default", style="Small.TLabel").grid(
+            row=4,
+            column=1,
+            sticky=tk.W,
+            padx=(116, 4),
+        )
+
+        ttk.Label(form, text="Output root").grid(row=5, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(form, textvariable=self.output_root_var).grid(row=5, column=1, sticky=tk.EW, pady=3, padx=(8, 4))
+        ttk.Button(form, text="Browse", command=self.browse_output_root).grid(row=5, column=2, sticky=tk.EW)
 
         ttk.Label(form, textvariable=self.disk_estimate_var, style="Small.TLabel", wraplength=720).grid(
-            row=5,
+            row=6,
             column=1,
             columnspan=2,
             sticky=tk.W,
@@ -277,12 +334,20 @@ class PyCamRecApp:
         )
 
         preview_frame = ttk.LabelFrame(form, text="Integrated preview")
-        preview_frame.grid(row=6, column=0, columnspan=3, sticky=tk.EW, pady=(8, 4))
+        preview_frame.grid(row=7, column=0, columnspan=3, sticky=tk.EW, pady=(8, 4))
         ttk.Checkbutton(preview_frame, text="Enable", variable=self.preview_enabled_var).pack(side=tk.LEFT, padx=(8, 8), pady=6)
         ttk.Label(preview_frame, text="Target width").pack(side=tk.LEFT, padx=(8, 4))
         ttk.Entry(preview_frame, textvariable=self.preview_width_var, width=7).pack(side=tk.LEFT)
         ttk.Label(preview_frame, text="FPS").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Entry(preview_frame, textvariable=self.preview_fps_var, width=7).pack(side=tk.LEFT)
+        ttk.Label(preview_frame, text="Display").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Combobox(
+            preview_frame,
+            textvariable=self.preview_display_mode_var,
+            values=("Auto", "Raw", "Color"),
+            state="readonly",
+            width=8,
+        ).pack(side=tk.LEFT)
         self.setup_preview_start_button = ttk.Button(preview_frame, text="Start preview", command=self.start_setup_preview)
         self.setup_preview_start_button.pack(side=tk.LEFT, padx=(14, 4))
         self.preview_start_buttons.append(self.setup_preview_start_button)
@@ -300,7 +365,7 @@ class PyCamRecApp:
         )
 
         ttk.Label(form, textvariable=self.preview_warning_var, style="Warning.TLabel", wraplength=720).grid(
-            row=7,
+            row=8,
             column=1,
             columnspan=2,
             sticky=tk.W,
@@ -312,7 +377,7 @@ class PyCamRecApp:
             form,
             text="Engineering test: allow UNSPECIFIED metadata",
             variable=self.allow_unspecified_var,
-        ).grid(row=8, column=1, columnspan=2, sticky=tk.W, pady=(8, 3), padx=(8, 4))
+        ).grid(row=9, column=1, columnspan=2, sticky=tk.W, pady=(8, 3), padx=(8, 4))
 
         form.columnconfigure(1, weight=1)
 
@@ -377,6 +442,103 @@ class PyCamRecApp:
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(10, weight=1)
 
+    def _build_validation_tab(self) -> None:
+        frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(frame, text="Validate")
+
+        ttk.Label(frame, text="Camera onboarding and evidence validation", style="Header.TLabel").grid(
+            row=0,
+            column=0,
+            columnspan=3,
+            sticky=tk.W,
+            pady=(0, 8),
+        )
+        ttk.Label(frame, text="Pixel type").grid(row=1, column=0, sticky=tk.W, pady=3)
+        self.onboard_pixel_combo = ttk.Combobox(
+            frame,
+            textvariable=self.onboard_pixel_format_var,
+            values=("Mono8", "BayerBG8", "RGB8", "BGR8"),
+            state="readonly",
+            width=16,
+        )
+        self.onboard_pixel_combo.grid(row=1, column=1, sticky=tk.W, pady=3, padx=(8, 4))
+        self.onboard_pixel_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_onboard_pixel_format_changed())
+        ttk.Label(frame, text="Camera PFS").grid(row=2, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(frame, textvariable=self.camera_profile_var).grid(
+            row=2,
+            column=1,
+            sticky=tk.EW,
+            pady=3,
+            padx=(8, 4),
+        )
+        ttk.Button(frame, text="Browse", command=self.browse_camera_profile).grid(row=2, column=2, sticky=tk.W)
+        ttk.Label(frame, text="Expected FPS").grid(row=3, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(frame, textvariable=self.onboard_expected_fps_var, width=16).grid(
+            row=3,
+            column=1,
+            sticky=tk.W,
+            pady=3,
+            padx=(8, 4),
+        )
+        ttk.Label(frame, text="Segment size (s)").grid(row=4, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(frame, textvariable=self.onboard_segment_seconds_var, width=16).grid(
+            row=4,
+            column=1,
+            sticky=tk.W,
+            pady=3,
+            padx=(8, 4),
+        )
+        ttk.Label(frame, text="Sweep durations").grid(row=5, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(frame, textvariable=self.onboard_durations_var, width=24).grid(
+            row=5,
+            column=1,
+            sticky=tk.W,
+            pady=3,
+            padx=(8, 4),
+        )
+        ttk.Label(frame, text="Preview").grid(row=6, column=0, sticky=tk.W, pady=3)
+        ttk.Combobox(
+            frame,
+            textvariable=self.onboard_preview_var,
+            values=("both", "on", "off"),
+            state="readonly",
+            width=16,
+        ).grid(row=6, column=1, sticky=tk.W, pady=3, padx=(8, 4))
+        ttk.Label(frame, text="Hash every / max").grid(row=7, column=0, sticky=tk.W, pady=3)
+        hash_frame = ttk.Frame(frame)
+        hash_frame.grid(row=7, column=1, sticky=tk.W, pady=3, padx=(8, 4))
+        ttk.Entry(hash_frame, textvariable=self.onboard_hash_every_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(hash_frame, text="/").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(hash_frame, textvariable=self.onboard_hash_max_var, width=8).pack(side=tk.LEFT)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=8, column=1, columnspan=2, sticky=tk.W, pady=(12, 4), padx=(8, 4))
+        ttk.Button(buttons, text="Detect camera caps", command=self.detect_camera_capabilities).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Generate config", command=self.generate_onboarding_config).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="Run validation sweep", command=self.run_onboarding_sweep).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="Verify last pixels", command=self.verify_last_session_pixels).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="Open sweeps", command=self.open_validation_sweeps).pack(side=tk.LEFT, padx=(8, 0))
+
+        ttk.Label(frame, textvariable=self.onboard_status_var, wraplength=560, justify=tk.LEFT).grid(
+            row=9,
+            column=0,
+            columnspan=3,
+            sticky=tk.W,
+            pady=(10, 4),
+        )
+        ttk.Label(
+            frame,
+            text=(
+                "Reliability target: expected frame count, ffprobe count, no gaps/drops, "
+                ">=98% expected FPS, queue below 90% and preferably below 25%, clean finalization, "
+                "pixel verification, and complete metadata before experiments."
+            ),
+            wraplength=650,
+            justify=tk.LEFT,
+            style="Small.TLabel",
+        ).grid(row=10, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        frame.columnconfigure(1, weight=1)
+
     def _build_reports_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(frame, text="Reports")
@@ -412,6 +574,7 @@ class PyCamRecApp:
             ("segments", "Segments"),
             ("temperature", "Temperature"),
             ("metadata", "Metadata"),
+            ("analysis", "Analysis read"),
         )
         for index, (key, title) in enumerate(card_specs):
             card = ttk.LabelFrame(cards, text=title, padding=8)
@@ -473,6 +636,7 @@ class PyCamRecApp:
     def _install_state_traces(self) -> None:
         for var in (
             self.duration_var,
+            self.segment_seconds_var,
             self.output_root_var,
             self.config_var,
             self.camera_profile_var,
@@ -490,17 +654,27 @@ class PyCamRecApp:
         if path is not None:
             self.config_var.set(str(path))
             self.camera_profile_var.set("")
+            try:
+                cfg = load_config(path, duration_s=self._duration_s(), output_root=self.output_root_var.get())
+            except Exception:
+                pass
+            else:
+                self.onboard_pixel_format_var.set(str(cfg.camera.expected_pixel_format))
+                self.onboard_expected_fps_var.set(f"{cfg.camera.expected_fps:g}")
+                self.onboard_segment_seconds_var.set(f"{cfg.writer.segment_seconds:g}")
+                self.segment_seconds_var.set("")
         self._load_profile_summary()
 
     def _refresh_start_state(self) -> None:
         process_running = self.process is not None and self.process.poll() is None
         setup_preview_running = self._setup_preview_running()
+        validation_running = self.validation_process is not None and self.validation_process.poll() is None
         missing = self._missing_metadata_fields()
         metadata_ok = not missing or self.allow_unspecified_var.get()
-        state = tk.NORMAL if metadata_ok and not process_running and not setup_preview_running else tk.DISABLED
+        state = tk.NORMAL if metadata_ok and not process_running and not setup_preview_running and not validation_running else tk.DISABLED
         for button in self.start_buttons:
             button.configure(state=state)
-        preview_start_state = tk.DISABLED if process_running or setup_preview_running else tk.NORMAL
+        preview_start_state = tk.DISABLED if process_running or setup_preview_running or validation_running else tk.NORMAL
         preview_stop_state = tk.NORMAL if setup_preview_running else tk.DISABLED
         for button in self.preview_start_buttons:
             button.configure(state=preview_start_state)
@@ -567,6 +741,181 @@ class PyCamRecApp:
             self.metadata_vars["camera_profile_path"].set(str(Path(self.config_var.get()).resolve()))
         self.check_metadata()
 
+    def generate_onboarding_config(self) -> None:
+        try:
+            base_config = Path(self.config_var.get()).expanduser().resolve()
+            cfg = load_config(base_config, duration_s=self._duration_s(), output_root=self.output_root_var.get())
+            pixel_format = self.onboard_pixel_format_var.get().strip() or cfg.camera.expected_pixel_format
+            expected_fps_text = self.onboard_expected_fps_var.get().strip()
+            expected_fps = float(expected_fps_text) if expected_fps_text else cfg.camera.expected_fps
+            camera_profile_path = self._onboarding_pfs_path(pixel_format, cfg)
+            camera_make = self._onboarding_camera_make(cfg)
+            expected_width, expected_height = self._onboarding_dimensions(cfg, camera_profile_path)
+            runtime_frame_rate_override = self._pfs_frame_rate_mismatch(camera_profile_path, expected_fps)
+            report = generate_camera_config(
+                base_config,
+                output_dir=GENERATED_CONFIG_DIR,
+                serial=self.onboard_detected_serial or None,
+                camera_make=camera_make,
+                pfs_path=camera_profile_path,
+                pixel_format=pixel_format,
+                expected_fps=expected_fps,
+                width=expected_width,
+                height=expected_height,
+                segment_seconds=float(self.onboard_segment_seconds_var.get()),
+                runtime_pixel_format_override=True,
+                runtime_frame_rate_override=runtime_frame_rate_override,
+            )
+        except Exception as exc:
+            self.onboard_status_var.set(f"Config generation failed: {exc}")
+            messagebox.showerror("Config generation failed", str(exc))
+            return
+        self.config_var.set(report.path)
+        self.camera_profile_var.set(report.pfs_path)
+        self.profile_choice_var.set(CUSTOM_PROFILE_LABEL)
+        self.segment_seconds_var.set(str(report.segment_seconds))
+        self.onboard_status_var.set(
+            f"Generated candidate config:\n{report.path}\n"
+            "Status is generated_unvalidated until a validation sweep passes on this hardware fingerprint."
+        )
+        self._append_output("\n=== Generated camera config ===\n" + json.dumps(report.to_dict(), indent=2) + "\n")
+        self._load_profile_summary()
+
+    def detect_camera_capabilities(self) -> None:
+        try:
+            cfg = load_config(self.config_var.get(), duration_s=self._duration_s(), output_root=self.output_root_var.get())
+            report = _run_pycamrec_json(["camera-capabilities", "--serial", cfg.camera.serial], timeout_s=45)
+        except Exception as exc:
+            self.onboard_status_var.set(
+                f"Active config could not be loaded ({exc}); probing the first available camera."
+            )
+            report = _run_pycamrec_json(["camera-capabilities"], timeout_s=45)
+        if report.get("error"):
+            fallback = _run_pycamrec_json(["camera-capabilities"], timeout_s=45)
+            if not fallback.get("error"):
+                report = fallback
+        self._append_output("\n=== Camera capabilities ===\n" + json.dumps(_jsonable(report), indent=2, sort_keys=True) + "\n")
+        if report.get("error"):
+            self.onboard_status_var.set(f"Capability probe failed: {report.get('error')}")
+            return
+        self.onboard_detected_capabilities = report
+        self.onboard_detected_serial = str(report.get("serial") or "")
+        pixel_formats = [str(item) for item in report.get("pixel_formats") or []]
+        if pixel_formats and hasattr(self, "onboard_pixel_combo"):
+            self.onboard_pixel_combo.configure(values=tuple(pixel_formats))
+            preferred = _preferred_pixel_format(pixel_formats)
+            self.onboard_pixel_format_var.set(preferred)
+        fps_value = _suggested_onboarding_fps(report, self.onboard_pixel_format_var.get())
+        if fps_value is not None:
+            self.onboard_expected_fps_var.set(f"{float(fps_value):g}")
+        matched_pfs = _matching_pfs_for_camera(self.onboard_detected_serial, self.onboard_pixel_format_var.get())
+        if matched_pfs is not None:
+            self.camera_profile_var.set(str(matched_pfs))
+        self.onboard_status_var.set(
+            f"Camera capabilities detected for serial {self.onboard_detected_serial or 'unknown'}. "
+            "Generated configs will use the detected serial, full-frame dimensions, and selected/matching PFS; "
+            "validation starts preview-on first."
+        )
+
+    def _on_onboard_pixel_format_changed(self) -> None:
+        pixel_format = self.onboard_pixel_format_var.get()
+        matched_pfs = _matching_pfs_for_camera(self.onboard_detected_serial, pixel_format)
+        if matched_pfs is not None:
+            self.camera_profile_var.set(str(matched_pfs))
+        fps_value = _suggested_onboarding_fps(self.onboard_detected_capabilities, pixel_format)
+        if fps_value is not None:
+            self.onboard_expected_fps_var.set(f"{float(fps_value):g}")
+        if matched_pfs is not None:
+            self.onboard_status_var.set(
+                f"Selected {pixel_format}; using matching PFS {matched_pfs.name}. "
+                "Generate config, then validate preview-on first."
+            )
+
+    def run_onboarding_sweep(self) -> None:
+        if self.validation_process is not None and self.validation_process.poll() is None:
+            messagebox.showinfo("Validation active", "A validation sweep is already running.")
+            return
+        if self.process is not None and self.process.poll() is None:
+            messagebox.showinfo("Recording active", "Stop recording before running validation.")
+            return
+        if self._setup_preview_running():
+            messagebox.showinfo("Preview active", "Stop setup preview before running validation.")
+            return
+        try:
+            config_path = self._write_runtime_config(preview_enabled_override=False)
+            hash_every = int(float(self.onboard_hash_every_var.get()))
+            hash_max = int(float(self.onboard_hash_max_var.get()))
+            command = [
+                sys.executable,
+                "-m",
+                "pycamrec",
+                "validation-sweep",
+                str(config_path),
+                "--output-root",
+                self.output_root_var.get(),
+                "--durations",
+                self.onboard_durations_var.get().strip(),
+                "--preview",
+                self.onboard_preview_var.get(),
+                "--preview-order",
+                "on-first",
+                "--preview-width",
+                self.preview_width_var.get(),
+                "--preview-fps",
+                self.preview_fps_var.get(),
+                "--verify-session-pixels",
+                "--pixel-max-decode-frames",
+                "1000",
+                "--source-frame-hash-every",
+                str(hash_every),
+                "--source-frame-hash-max-frames",
+                str(hash_max),
+            ]
+            if self.allow_unspecified_var.get():
+                command.append("--allow-unspecified-metadata")
+            else:
+                command.append("--require-complete-metadata")
+        except Exception as exc:
+            messagebox.showerror("Could not prepare validation", str(exc))
+            return
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        try:
+            self.validation_process = subprocess.Popen(
+                command,
+                cwd=str(WORKSPACE_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=creationflags,
+                env=_child_env(),
+            )
+        except Exception as exc:
+            self.validation_process = None
+            messagebox.showerror("Could not start validation", str(exc))
+            return
+        self.status_var.set("Validation sweep")
+        self.onboard_status_var.set("Validation sweep running. Cases are appended to the command output.")
+        self._append_output("\n=== Validation sweep started ===\n" + " ".join(command) + "\n")
+        self.validation_reader_thread = threading.Thread(target=self._read_validation_output, daemon=True)
+        self.validation_reader_thread.start()
+
+    def verify_last_session_pixels(self) -> None:
+        session = self._selected_or_last_session()
+        if session is None:
+            messagebox.showinfo("No session", "Select a session or complete a recording first.")
+            return
+        try:
+            report = _run_pycamrec_json(["verify-session-pixels", str(session), "--max-decode-frames", "1000"], timeout_s=1800)
+        except Exception as exc:
+            messagebox.showerror("Pixel verification failed", str(exc))
+            return
+        text = json.dumps(_jsonable(report), indent=2, sort_keys=True)
+        self._append_output("\n=== Session pixel verification ===\n" + text + "\n")
+        self.onboard_status_var.set(
+            f"Pixel verification for {session.name}: {report.get('status', 'unknown')}"
+        )
+
     def reset_metadata(self) -> None:
         for field_name, _ in METADATA_FIELDS:
             self.metadata_vars[field_name].set("UNSPECIFIED")
@@ -612,7 +961,7 @@ class PyCamRecApp:
             return
 
         try:
-            runtime_config = self._write_runtime_config(preview_enabled_override=True)
+            runtime_config = self._write_runtime_config(preview_enabled_override=True, setup_preview=True)
             cfg = load_config(runtime_config)
             device_report = _run_pycamrec_json(["devices"], timeout_s=45)
         except Exception as exc:
@@ -790,6 +1139,7 @@ class PyCamRecApp:
         self.preview_status_var.set(
             f"00:00 | 0/{cfg.expected_total_frames} | 0.0 fps | queue 0/{cfg.writer.queue_max_frames}"
         )
+        self._reset_run_qc_state()
         for button in self.start_buttons:
             button.configure(state=tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL)
@@ -834,6 +1184,14 @@ class PyCamRecApp:
         return_code = self.setup_preview_process.wait()
         self.ui_queue.put(("preview_done", return_code))
 
+    def _read_validation_output(self) -> None:
+        assert self.validation_process is not None
+        if self.validation_process.stdout is not None:
+            for line in self.validation_process.stdout:
+                self.ui_queue.put(("validation_line", line))
+        return_code = self.validation_process.wait()
+        self.ui_queue.put(("validation_done", return_code))
+
     def refresh_sessions(self) -> None:
         if not hasattr(self, "session_list"):
             return
@@ -869,7 +1227,7 @@ class PyCamRecApp:
             messagebox.showerror("Report failed", str(exc))
             return
         self._display_report(session_dir, report, append_output=True)
-        self.notebook.select(3)
+        self.notebook.select(4)
         self.report_notebook.select(0)
 
     def _display_report(self, session_dir: Path, report: dict[str, Any], append_output: bool) -> None:
@@ -888,6 +1246,7 @@ class PyCamRecApp:
         segments = report.get("segments", {})
         health = report.get("health", {})
         experiment = report.get("experiment_metadata", {})
+        analysis = report.get("analysis", {})
         qc = report.get("qc", {})
 
         count = frames.get("count")
@@ -923,6 +1282,11 @@ class PyCamRecApp:
         self.report_summary_vars["metadata"].set(
             "complete" if metadata_complete else "incomplete\n" + ", ".join(str(item) for item in missing[:4])
         )
+        self.report_summary_vars["analysis"].set(
+            f"{analysis.get('source_pixel_format') or 'unknown'} | "
+            f"{analysis.get('channel_semantics') or 'unknown'}\n"
+            f"{(analysis.get('recommendations') or {}).get('preferred_mode') or 'see manifest'}"
+        )
         self.report_summary_vars["qc"].set(_qc_display_text(str(qc.get("status") or "unknown")))
 
         issues = [str(item) for item in (qc.get("issues") or [])]
@@ -947,6 +1311,12 @@ class PyCamRecApp:
             self.qc_status_label.configure(style="Fail.TLabel")
         else:
             self.qc_status_label.configure(style="Warn.TLabel")
+
+    def _reset_run_qc_state(self) -> None:
+        self.qc_status_var.set("RUNNING")
+        self.qc_status_label.configure(style="Warn.TLabel")
+        for key, var in self.report_summary_vars.items():
+            var.set("Pending current run" if key == "qc" else "No current report")
 
     def open_last_session_folder(self) -> None:
         if self.last_session_dir is None:
@@ -980,6 +1350,11 @@ class PyCamRecApp:
 
     def open_config_folder(self) -> None:
         _open_path(Path(self.config_var.get()).expanduser().resolve().parent)
+
+    def open_validation_sweeps(self) -> None:
+        path = WORKSPACE_ROOT / "validation_sweeps"
+        path.mkdir(parents=True, exist_ok=True)
+        _open_path(path)
 
     def open_camera_profile_folder(self) -> None:
         camera_profile = self.camera_profile_var.get().strip()
@@ -1028,17 +1403,36 @@ class PyCamRecApp:
             return
         if not self.camera_profile_var.get().strip():
             self.camera_profile_var.set(str(cfg.camera.pfs_path))
+        if not self.onboard_pixel_format_var.get().strip():
+            self.onboard_pixel_format_var.set(str(cfg.camera.expected_pixel_format))
+        if not self.onboard_expected_fps_var.get().strip():
+            self.onboard_expected_fps_var.set(f"{cfg.camera.expected_fps:g}")
+        if not self.onboard_segment_seconds_var.get().strip():
+            self.onboard_segment_seconds_var.set(f"{cfg.writer.segment_seconds:g}")
         profile = cfg.recording_profile
+        try:
+            segment_seconds = self._segment_seconds(fallback=cfg.writer.segment_seconds)
+        except Exception:
+            segment_seconds = cfg.writer.segment_seconds
         self.profile_summary_var.set(
             f"{profile.display_name} | {profile.pixel_fidelity} | "
-            f"{profile.validation_status} | expected {profile.expected_bitrate_mbps} Mbps\n"
-            f"{profile.recommended_use}"
+            f"{profile.validation_status} | target {cfg.writer.expected_bitrate_mbps} Mbps\n"
+            f"Camera {cfg.camera.make} serial {cfg.camera.serial} | "
+            f"{cfg.camera.expected_pixel_format} {cfg.camera.expected_width}x{cfg.camera.expected_height} "
+            f"@ {cfg.camera.expected_fps:g} fps | output .{cfg.writer.container} | segment {segment_seconds:g}s\n"
+            f"Temperature warning {cfg.camera.temperature_warning_c:g} C; health checks every "
+            f"{cfg.camera.health_check_interval_s:g}s. {profile.recommended_use}"
         )
         self.disk_estimate_var.set(_disk_estimate_text(cfg))
         self.preview_warning_var.set(_preview_warning_text(cfg))
         self._refresh_start_state()
 
-    def _write_runtime_config(self, preview_enabled_override: bool | None = None) -> Path:
+    def _write_runtime_config(
+        self,
+        preview_enabled_override: bool | None = None,
+        *,
+        setup_preview: bool = False,
+    ) -> Path:
         import yaml
 
         base_path = Path(self.config_var.get()).expanduser().resolve()
@@ -1052,17 +1446,25 @@ class PyCamRecApp:
         session["output_root"] = self.output_root_var.get()
         data["session"] = session
 
+        writer = dict(data.get("writer", {}))
+        writer["segment_seconds"] = self._segment_seconds()
+        data["writer"] = writer
+
+        camera = dict(data.get("camera", {}))
         camera_profile = self.camera_profile_var.get().strip()
         if camera_profile:
-            camera = dict(data.get("camera", {}))
+            self._validate_camera_profile_override(base_path, camera, camera_profile)
             camera["pfs_path"] = camera_profile
-            data["camera"] = camera
+        data["camera"] = camera
 
         preview = dict(data.get("preview", {}))
         preview["enabled"] = bool(self.preview_enabled_var.get() if preview_enabled_override is None else preview_enabled_override)
         preview["width"] = self._preview_width()
         preview["max_fps"] = float(self.preview_fps_var.get())
-        preview["sink"] = "shm_raw"
+        preview["sink"] = _integrated_preview_sink(
+            setup_preview=setup_preview,
+            pixel_format=str(camera.get("expected_pixel_format") or ""),
+        )
         preview["image_path"] = str(PREVIEW_IMAGE_PATH)
         data["preview"] = preview
 
@@ -1085,6 +1487,88 @@ class PyCamRecApp:
         runtime_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
         return runtime_path
 
+    def _onboarding_pfs_path(self, pixel_format: str, cfg: Any) -> Path:
+        detected_serial = self.onboard_detected_serial.strip()
+        selected = self.camera_profile_var.get().strip()
+        if detected_serial:
+            if selected and detected_serial in Path(selected).name:
+                return Path(selected).expanduser().resolve()
+            matched = _matching_pfs_for_camera(detected_serial, pixel_format)
+            if matched is not None:
+                self.camera_profile_var.set(str(matched))
+                return matched
+            raise ValueError(
+                f"No .pfs file matching detected camera serial {detected_serial!r} was found. "
+                "Export or browse the camera's PFS before generating a config."
+            )
+        return Path(selected).expanduser().resolve() if selected else cfg.camera.pfs_path
+
+    def _onboarding_camera_make(self, cfg: Any) -> str:
+        return _camera_make_from_capabilities(self.onboard_detected_capabilities) or cfg.camera.make
+
+    def _onboarding_dimensions(self, cfg: Any, pfs_path: Path) -> tuple[int, int]:
+        width_info = self.onboard_detected_capabilities.get("width") or {}
+        height_info = self.onboard_detected_capabilities.get("height") or {}
+        width_value = _valid_node_value_or_max(width_info)
+        height_value = _valid_node_value_or_max(height_info)
+        if width_value and height_value:
+            return int(width_value), int(height_value)
+        pfs_features = parse_pfs_features(pfs_path)
+        pfs_width = pfs_features.get("Width")
+        pfs_height = pfs_features.get("Height")
+        if pfs_width and pfs_height:
+            return int(float(pfs_width)), int(float(pfs_height))
+        return cfg.camera.expected_width, cfg.camera.expected_height
+
+    def _pfs_frame_rate_mismatch(self, pfs_path: Path, expected_fps: float) -> bool:
+        features = parse_pfs_features(pfs_path)
+        actual = features.get("AcquisitionFrameRate")
+        if actual is None:
+            return False
+        try:
+            return abs(float(actual) - float(expected_fps)) > 0.01
+        except (TypeError, ValueError):
+            return True
+
+    def _validate_camera_profile_override(
+        self,
+        base_path: Path,
+        camera: dict[str, Any],
+        camera_profile: str,
+    ) -> None:
+        pfs_path = Path(camera_profile).expanduser()
+        if not pfs_path.is_absolute():
+            pfs_path = (base_path.parent / pfs_path).resolve()
+        features = parse_pfs_features(pfs_path)
+        comparisons = (
+            ("Width", "expected_width", str(camera.get("expected_width"))),
+            ("Height", "expected_height", str(camera.get("expected_height"))),
+            ("PixelFormat", "expected_pixel_format", str(camera.get("expected_pixel_format"))),
+        )
+        mismatches = []
+        for pfs_key, _config_key, expected in comparisons:
+            actual = features.get(pfs_key)
+            if actual is not None and actual != expected:
+                if pfs_key == "PixelFormat" and bool(camera.get("allow_runtime_pixel_format_override", False)):
+                    continue
+                mismatches.append(f"{pfs_key} {actual} != {expected}")
+        actual_fps = features.get("AcquisitionFrameRate")
+        expected_fps = camera.get("expected_fps")
+        if actual_fps is not None and expected_fps is not None:
+            try:
+                fps_matches = abs(float(actual_fps) - float(expected_fps)) <= 0.01
+            except (TypeError, ValueError):
+                fps_matches = False
+            if not fps_matches:
+                if not bool(camera.get("allow_runtime_frame_rate_override", False)):
+                    mismatches.append(f"AcquisitionFrameRate {actual_fps} != {expected_fps}")
+        if mismatches:
+            raise ValueError(
+                "Selected camera profile does not match the active profile config. "
+                "Choose the matching recording profile for this camera instead. "
+                "Mismatches: " + "; ".join(mismatches)
+            )
+
     def _metadata_values(self) -> dict[str, str]:
         values = {field_name: var.get().strip() for field_name, var in self.metadata_vars.items()}
         if self.notes_text is not None:
@@ -1105,6 +1589,22 @@ class PyCamRecApp:
         value = float(self.duration_var.get())
         if value <= 0:
             raise ValueError("Duration must be positive.")
+        return value
+
+    def _segment_seconds(self, fallback: float | None = None) -> float:
+        text = self.segment_seconds_var.get().strip()
+        if not text:
+            if fallback is not None:
+                return float(fallback)
+            cfg = load_config(
+                self.config_var.get(),
+                duration_s=self._duration_s(),
+                output_root=self.output_root_var.get(),
+            )
+            return float(cfg.writer.segment_seconds)
+        value = float(text)
+        if value <= 0:
+            raise ValueError("Segment size must be positive.")
         return value
 
     def _preview_width(self) -> int:
@@ -1129,6 +1629,10 @@ class PyCamRecApp:
                 self._handle_setup_preview_line(str(payload))
             elif kind == "preview_done":
                 self._handle_setup_preview_done(int(payload))
+            elif kind == "validation_line":
+                self._handle_validation_line(str(payload))
+            elif kind == "validation_done":
+                self._handle_validation_done(int(payload))
         self.root.after(100, self._poll_ui_queue)
 
     def _handle_devices(self, report: dict[str, Any]) -> None:
@@ -1155,9 +1659,9 @@ class PyCamRecApp:
         if match:
             self.last_session_dir = Path(match.group(1))
             self.session_var.set(str(self.last_session_dir))
-        if "health WARNING" in line:
+        if "Health WARNING" in line or "health WARNING" in line:
             self.monitor_status_var.set("Health warning")
-        elif "health OK" in line:
+        elif "Health OK" in line or "health OK" in line:
             self.monitor_status_var.set("Recording")
         elif "Writer queue pressure was high" in line:
             self.monitor_status_var.set("Queue pressure")
@@ -1214,6 +1718,43 @@ class PyCamRecApp:
         self._append_output(f"=== Setup preview process exited with code {return_code} ===\n")
         self.logger.info("Setup preview exited with code %s", return_code)
         self._refresh_start_state()
+
+    def _handle_validation_line(self, line: str) -> None:
+        self._append_output(line)
+        self.logger.info("validation: %s", line.rstrip())
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        case_id = payload.get("case_id", "case")
+        status = str(payload.get("qc_status") or "unknown")
+        fps = payload.get("observed_fps")
+        queue_depth = payload.get("max_queue_depth")
+        queue_capacity = payload.get("queue_capacity")
+        session_dir = str(payload.get("session_dir") or "").strip()
+        if session_dir:
+            self.last_session_dir = Path(session_dir)
+            self.session_var.set(session_dir)
+        self.onboard_status_var.set(
+            f"{case_id}: {status} | fps={_format_number(fps)} | "
+            f"queue={queue_depth}/{queue_capacity} | acquisition={payload.get('acquisition_pass')} | "
+            f"pixel={payload.get('pixel_status', 'not_run')} | "
+            f"evidence_ready={payload.get('evidence_ready')} | experiment_ready={payload.get('experiment_ready')}"
+        )
+
+    def _handle_validation_done(self, return_code: int) -> None:
+        self.validation_process = None
+        if return_code == 0:
+            self.status_var.set("Validation completed")
+            self.onboard_status_var.set(
+                "Validation sweep completed with at least one QC pass. Review the preview-mode-specific "
+                "lock recommendation before writing an approval fingerprint into a config."
+            )
+        else:
+            self.status_var.set(f"Validation exited with code {return_code}")
+            self.onboard_status_var.set("Validation sweep did not produce a scientific pass. Review command output and validation_summary.json.")
+        self._append_output(f"=== Validation sweep exited with code {return_code} ===\n")
+        self.refresh_sessions()
 
     def _handle_record_done(self, return_code: int) -> None:
         self.stop_button.configure(state=tk.DISABLED)
@@ -1306,42 +1847,74 @@ class PyCamRecApp:
             image_key = f"{shm_name}|{sequence}"
             if image_key == self.preview_image_key:
                 return
-            payload = self._preview_payload_from_shm(frame_metadata, header_bytes, width, height)
-            header = f"P5\n{width} {height}\n255\n".encode("ascii")
-            self.preview_base_photo = self._photo_from_pgm_bytes(header + payload)
+            image_bytes, image_format, display_width, display_height = self._preview_image_from_shm(
+                frame_metadata,
+                header_bytes,
+                width,
+                height,
+            )
+            magic = "P6" if image_format == "PPM" else "P5"
+            header = f"{magic}\n{display_width} {display_height}\n255\n".encode("ascii")
+            self.preview_base_photo = self._photo_from_pnm_bytes(header + image_bytes, image_format)
             self.preview_image_key = image_key
             self.preview_metadata = frame_metadata
             self._display_preview_photo()
             self._update_preview_metadata(frame_metadata)
         except Exception as exc:
             self.preview_status_var.set(f"Preview unavailable: {type(exc).__name__}")
+            self.logger.debug("Integrated preview frame could not be rendered", exc_info=True)
 
-    def _preview_payload_from_shm(
+    def _preview_image_from_shm(
         self,
         metadata: dict[str, Any],
         header_bytes: int,
         preview_width: int,
         preview_height: int,
-    ) -> bytes:
+    ) -> tuple[bytes, str, int, int]:
         assert self.preview_shm is not None
         buffer_format = str(metadata.get("buffer_format") or "gray8_downsampled")
-        if buffer_format != "raw_mono8":
+        if buffer_format == "gray8_downsampled":
             start = header_bytes
-            return bytes(self.preview_shm.buf[start : start + preview_width * preview_height])
+            return (
+                bytes(self.preview_shm.buf[start : start + preview_width * preview_height]),
+                "PGM",
+                preview_width,
+                preview_height,
+            )
 
         np = self._preview_np()
         buffer_width = int(metadata.get("buffer_width") or metadata.get("source_width") or 0)
         buffer_height = int(metadata.get("buffer_height") or metadata.get("source_height") or 0)
         stride = int(metadata.get("downsample_stride") or 1)
         if buffer_width <= 0 or buffer_height <= 0:
-            return b""
+            return b"", "PGM", preview_width, preview_height
+        if buffer_format in {"raw_rgb8", "raw_bgr8"}:
+            image = np.ndarray(
+                (buffer_height, buffer_width, 3),
+                dtype=np.uint8,
+                buffer=self.preview_shm.buf,
+                offset=header_bytes,
+            )
+            display = image[::stride, ::stride, :].copy(order="C")
+            if buffer_format == "raw_bgr8":
+                display = display[:, :, ::-1].copy(order="C")
+            return display.tobytes(), "PPM", int(display.shape[1]), int(display.shape[0])
+
         image = np.ndarray(
             (buffer_height, buffer_width),
             dtype=np.uint8,
             buffer=self.preview_shm.buf,
             offset=header_bytes,
         )
-        return image[::stride, ::stride].copy(order="C").tobytes()
+        pixel_format = str(metadata.get("source_pixel_format") or "")
+        if self._preview_should_debayer(pixel_format):
+            rgb = self._bayer_to_rgb_preview(image, pixel_format)
+            if rgb is not None:
+                display = rgb[::stride, ::stride, :].copy(order="C")
+                return display.tobytes(), "PPM", int(display.shape[1]), int(display.shape[0])
+
+        gray = image[::stride, ::stride].copy(order="C")
+        return gray.tobytes(), "PGM", int(gray.shape[1]), int(gray.shape[0])
 
     def _preview_np(self) -> Any:
         if self.preview_numpy is None:
@@ -1349,6 +1922,42 @@ class PyCamRecApp:
 
             self.preview_numpy = np
         return self.preview_numpy
+
+    def _preview_cv(self) -> Any | None:
+        if self.preview_cv2 is False:
+            return None
+        if self.preview_cv2 is None:
+            try:
+                import cv2
+            except ImportError:
+                self.preview_cv2 = False
+            else:
+                try:
+                    cv2.setNumThreads(1)
+                except Exception:
+                    pass
+                self.preview_cv2 = cv2
+        return None if self.preview_cv2 is False else self.preview_cv2
+
+    def _preview_should_debayer(self, pixel_format: str) -> bool:
+        mode = self.preview_display_mode_var.get().strip().lower()
+        if mode == "raw":
+            return False
+        if mode == "color":
+            return _is_bayer_pixel_format(pixel_format)
+        return _is_bayer_pixel_format(pixel_format)
+
+    def _bayer_to_rgb_preview(self, image: Any, pixel_format: str) -> Any | None:
+        cv2 = self._preview_cv()
+        if cv2 is not None:
+            code_name = _bayer_cv2_code_name(pixel_format)
+            code = getattr(cv2, code_name, None)
+            if code is not None:
+                try:
+                    return cv2.cvtColor(image, code)
+                except Exception:
+                    pass
+        return _bayer_to_rgb_nearest(self._preview_np(), image, pixel_format)
 
     def _read_shm_frame_metadata(self, header_bytes: int) -> dict[str, Any]:
         if self.preview_shm is None:
@@ -1363,14 +1972,15 @@ class PyCamRecApp:
             return {}
         return data if isinstance(data, dict) else {}
 
-    def _photo_from_pgm_bytes(self, data: bytes) -> tk.PhotoImage:
+    def _photo_from_pnm_bytes(self, data: bytes, image_format: str) -> tk.PhotoImage:
         try:
-            return tk.PhotoImage(data=data, format="PGM")
+            return tk.PhotoImage(data=data, format=image_format)
         except tk.TclError:
             try:
-                return tk.PhotoImage(data=base64.b64encode(data), format="PGM")
+                return tk.PhotoImage(data=base64.b64encode(data), format=image_format)
             except tk.TclError:
-                path = RUNTIME_DIR / f"gui_preview_render_{self.preview_render_slot:02d}.pgm"
+                suffix = ".ppm" if image_format == "PPM" else ".pgm"
+                path = RUNTIME_DIR / f"gui_preview_render_{self.preview_render_slot:02d}{suffix}"
                 self.preview_render_slot = (self.preview_render_slot + 1) % 4
                 path.write_bytes(data)
                 return tk.PhotoImage(file=str(path))
@@ -1488,6 +2098,14 @@ class PyCamRecApp:
             self.stop_recording()
             self.logger.info("Close requested during active recording; safe stop requested")
             return
+        if self.validation_process is not None and self.validation_process.poll() is None:
+            if not messagebox.askyesno(
+                "Validation active",
+                "A validation sweep is still running. Stop it and close the GUI?",
+            ):
+                return
+            self.validation_process.terminate()
+            self.logger.info("Close requested during active validation; process terminated")
         self._close_preview_shm()
         logging.shutdown()
         self.root.destroy()
@@ -1540,11 +2158,15 @@ def _qc_display_text(status: str) -> str:
         return "FAIL REALTIME"
     if status == "fail_frame_integrity":
         return "FAIL FRAME INTEGRITY"
+    if status == "fail_finalization":
+        return "FAIL FINALIZATION"
+    if status == "in_progress":
+        return "IN PROGRESS"
     return status.replace("_", " ").upper()
 
 
 def _disk_estimate_text(cfg: Any) -> str:
-    bitrate_mbps = cfg.recording_profile.expected_bitrate_mbps or cfg.writer.expected_bitrate_mbps
+    bitrate_mbps = cfg.writer.expected_bitrate_mbps or cfg.recording_profile.expected_bitrate_mbps
     compressed_bytes = None
     if bitrate_mbps:
         compressed_bytes = float(bitrate_mbps) * 1_000_000.0 / 8.0 * cfg.session.duration_s
@@ -1563,8 +2185,14 @@ def _disk_estimate_text(cfg: Any) -> str:
         if compressed_bytes is not None:
             parts.append(f"remaining margin {_format_bytes(free_bytes - compressed_bytes)}")
         parts.append(f"free {_format_bytes(free_bytes)}")
+        if bitrate_mbps:
+            capacity_s = free_bytes * 8.0 / (float(bitrate_mbps) * 1_000_000.0)
+            parts.append(f"about {_format_duration(capacity_s)} at target rate before reserve")
     parts.append(f"raw payload would be {_format_bytes(raw_bytes)}")
-    return "Disk estimate: " + " | ".join(parts)
+    prefix = "Disk estimate: "
+    if compressed_bytes is not None and free_bytes is not None and compressed_bytes * 1.20 > free_bytes:
+        prefix = "WARNING - insufficient 20% disk reserve: "
+    return prefix + " | ".join(parts)
 
 
 def _disk_probe_path(path: Path) -> Path:
@@ -1577,14 +2205,142 @@ def _disk_probe_path(path: Path) -> Path:
 def _preview_warning_text(cfg: Any) -> str:
     if not cfg.preview.enabled:
         return ""
+    if cfg.camera.make == "basler_cxp" and cfg.camera.expected_fps >= 150:
+        return (
+            "Preview-on CXP MP4 failed the latest timing run. Use setup preview for positioning, "
+            "then record scientific CXP MP4 runs with preview off until a validation sweep passes."
+        )
     if cfg.recording_profile.id in SCIENTIFIC_PREVIEW_PROFILE_IDS:
         return (
             "Preview is enabled for a scientific recording profile. Use it for positioning, "
             "then validate important runs with preview off if QC reports host-timing pressure."
         )
+    if str(cfg.camera.expected_pixel_format).upper() in {"RGB8", "BGR8"}:
+        return "RGB/BGR camera output triples the USB payload; run the validation sweep before scientific color recording."
     if cfg.recording_profile.pixel_fidelity == "lossless":
         return "Preview is enabled during lossless calibration; keep runs short and confirm QC after recording."
     return ""
+
+
+def _preferred_pixel_format(pixel_formats: list[str]) -> str:
+    for candidate in ("Mono8", "BayerBG8", "BayerRG8", "BayerGB8", "BayerGR8", "RGB8", "BGR8"):
+        if candidate in pixel_formats:
+            return candidate
+    return pixel_formats[0] if pixel_formats else "Mono8"
+
+
+def _integrated_preview_sink(*, setup_preview: bool, pixel_format: str) -> str:
+    """Use the lightest shared-memory payload that preserves preview semantics."""
+
+    if setup_preview and not is_mono_pixel_format(pixel_format):
+        return "shm_raw"
+    return "shm"
+
+
+def _matching_pfs_for_camera(serial: str, pixel_format: str) -> Path | None:
+    serial = str(serial or "").strip()
+    if not serial:
+        return None
+    search_roots = {WORKSPACE_ROOT, RESOURCE_ROOT}
+    candidates = sorted(
+        {
+            path.resolve()
+            for root in search_roots
+            for path in root.glob(f"*{serial}*.pfs")
+        }
+    )
+    if not candidates:
+        return None
+    scored = [(_pfs_candidate_score(path, pixel_format), len(path.name), str(path).lower(), path) for path in candidates]
+    scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return scored[0][3]
+
+
+def _pfs_candidate_score(path: Path, pixel_format: str) -> int:
+    score = 0
+    name = path.name.lower()
+    try:
+        features = parse_pfs_features(path)
+    except OSError:
+        features = {}
+    pfs_pixel = str(features.get("PixelFormat") or "")
+    if pfs_pixel == pixel_format:
+        score += 50
+    if is_mono_pixel_format(pixel_format):
+        if "mono" in name:
+            score += 30
+        if is_mono_pixel_format(pfs_pixel):
+            score += 30
+        elif pfs_pixel:
+            score -= 25
+    elif is_bayer_camera_pixel_format(pixel_format):
+        if is_bayer_camera_pixel_format(pfs_pixel):
+            score += 30
+        if "mono" in name:
+            score -= 20
+    elif is_rgb_pixel_format(pixel_format):
+        if is_rgb_pixel_format(pfs_pixel):
+            score += 35
+        elif is_bayer_camera_pixel_format(pfs_pixel):
+            score += 25
+        if "mono" in name or is_mono_pixel_format(pfs_pixel):
+            score -= 25
+        else:
+            score += 10
+    return score
+
+
+def _camera_make_from_capabilities(report: dict[str, Any]) -> str:
+    device_info = report.get("device_info") or {}
+    tokens = " ".join(str(device_info.get(key) or "") for key in ("DeviceClass", "TLType", "DeviceFactory"))
+    normalized = tokens.lower()
+    if "usb" in normalized or "u3v" in normalized:
+        return "basler_usb"
+    if "cxp" in normalized:
+        return "basler_cxp"
+    return "basler" if report else ""
+
+
+def _suggested_onboarding_fps(report: dict[str, Any], pixel_format: str) -> float | None:
+    fps_info = report.get("acquisition_frame_rate") or {}
+    value = fps_info.get("value")
+    if value is None:
+        max_value = fps_info.get("max")
+        if max_value is not None and float(max_value) < 10_000:
+            value = max_value
+    if value is None:
+        return None
+    suggested = float(value)
+    model = str(report.get("model") or (report.get("device_info") or {}).get("ModelName") or "").lower()
+    if is_rgb_pixel_format(pixel_format) and "aca1300" in model and suggested > 75.0:
+        return 75.0
+    return suggested
+
+
+def _valid_node_value_or_max(info: dict[str, Any]) -> int | None:
+    safe_value = _numeric_or_none(info.get("safe_value"))
+    if safe_value is not None:
+        return int(safe_value)
+    value = _numeric_or_none(info.get("value"))
+    minimum = _numeric_or_none(info.get("min"))
+    maximum = _numeric_or_none(info.get("max"))
+    if value is not None:
+        above_min = minimum is None or value >= minimum
+        below_max = maximum is None or value <= maximum
+        if above_min and below_max:
+            return int(value)
+    if maximum is not None:
+        return int(maximum)
+    return int(value) if value is not None else None
+
+
+def _numeric_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _make_app_logger() -> tuple[logging.Logger, Path]:
@@ -1685,6 +2441,64 @@ def _prepend_env_paths(current: str, paths: list[str]) -> str:
         if Path(item).exists() and item.rstrip("\\/").lower() not in normalized_existing
     ]
     return os.pathsep.join(additions + existing)
+
+
+def _is_bayer_pixel_format(pixel_format: str) -> bool:
+    return _bayer_pattern(pixel_format) is not None
+
+
+def _bayer_pattern(pixel_format: str) -> str | None:
+    normalized = pixel_format.replace("_", "").replace(" ", "").lower()
+    for pattern in ("bg", "gb", "gr", "rg"):
+        if normalized.startswith(f"bayer{pattern}"):
+            return pattern
+    if normalized.startswith("bayer8"):
+        return "bg"
+    return None
+
+
+def _bayer_cv2_code_name(pixel_format: str) -> str:
+    pattern = _bayer_pattern(pixel_format) or "bg"
+    return {
+        "bg": "COLOR_BayerBG2RGB",
+        "gb": "COLOR_BayerGB2RGB",
+        "gr": "COLOR_BayerGR2RGB",
+        "rg": "COLOR_BayerRG2RGB",
+    }[pattern]
+
+
+def _bayer_to_rgb_nearest(np: Any, image: Any, pixel_format: str) -> Any | None:
+    pattern = _bayer_pattern(pixel_format)
+    if pattern is None or image.shape[0] < 2 or image.shape[1] < 2:
+        return None
+    even_height = image.shape[0] - (image.shape[0] % 2)
+    even_width = image.shape[1] - (image.shape[1] % 2)
+    cells = image[:even_height, :even_width].reshape(even_height // 2, 2, even_width // 2, 2)
+    rgb = np.empty((even_height // 2, even_width // 2, 3), dtype=np.uint8)
+    if pattern == "bg":
+        blue = cells[:, 0, :, 0]
+        green_a = cells[:, 0, :, 1]
+        green_b = cells[:, 1, :, 0]
+        red = cells[:, 1, :, 1]
+    elif pattern == "gb":
+        green_a = cells[:, 0, :, 0]
+        blue = cells[:, 0, :, 1]
+        red = cells[:, 1, :, 0]
+        green_b = cells[:, 1, :, 1]
+    elif pattern == "gr":
+        green_a = cells[:, 0, :, 0]
+        red = cells[:, 0, :, 1]
+        blue = cells[:, 1, :, 0]
+        green_b = cells[:, 1, :, 1]
+    else:
+        red = cells[:, 0, :, 0]
+        green_a = cells[:, 0, :, 1]
+        green_b = cells[:, 1, :, 0]
+        blue = cells[:, 1, :, 1]
+    rgb[:, :, 0] = red
+    rgb[:, :, 1] = ((green_a.astype(np.uint16) + green_b.astype(np.uint16)) // 2).astype(np.uint8)
+    rgb[:, :, 2] = blue
+    return np.repeat(np.repeat(rgb, 2, axis=0), 2, axis=1)
 
 
 def _jsonable(value: Any) -> Any:

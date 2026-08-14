@@ -1,0 +1,1 @@
+"""PyCamRec automated tests."""

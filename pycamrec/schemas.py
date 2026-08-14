@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .pixel_formats import bytes_per_pixel
+
 
 @dataclass(frozen=True)
 class SessionConfig:
@@ -29,7 +31,10 @@ class CameraConfig:
     max_num_buffer: int = 512
     enable_chunks: bool = True
     strict_validation: bool = True
+    allow_runtime_pixel_format_override: bool = False
+    allow_runtime_frame_rate_override: bool = False
     temperature_warning_c: float = 40.0
+    health_check_interval_s: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,7 @@ class WriterConfig:
     spool_output: bool = False
     spool_chunk_bytes: int = 8 * 1024 * 1024
     spool_max_bytes: int = 32 * 1024**3
+    finalize_timeout_s: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -106,19 +112,25 @@ class MetadataConfig:
     per_frame_format: str = "csv"
     flush_every_frames: int = 200
     record_host_timestamps: bool = True
+    source_frame_hash_every: int = 0
+    source_frame_hash_max_frames: int = 0
 
 
 @dataclass(frozen=True)
 class PreviewConfig:
     enabled: bool = False
-    max_fps: float = 30.0
-    width: int = 800
+    max_fps: float = 10.0
+    width: int = 512
     height: int | None = None
     sample_every: int | None = None
     overlay: bool = True
     window_title: str = "PyCamRec Preview"
     sink: str = "window"
     image_path: Path | None = None
+    shed_queue_fraction: float = 0.10
+    shed_fps_ratio: float = 0.99
+    throttle_cooldown_s: float = 2.0
+    opencv_threads: int = 1
 
 
 @dataclass(frozen=True)
@@ -134,9 +146,11 @@ class PyCamRecConfig:
 
     @property
     def frame_bytes(self) -> int:
-        if self.writer.input_pix_fmt not in {"gray", "gray8"}:
-            raise ValueError(f"Cannot estimate byte size for {self.writer.input_pix_fmt!r}.")
-        return self.camera.expected_width * self.camera.expected_height
+        return (
+            self.camera.expected_width
+            * self.camera.expected_height
+            * bytes_per_pixel(self.camera.expected_pixel_format)
+        )
 
     @property
     def expected_total_frames(self) -> int:

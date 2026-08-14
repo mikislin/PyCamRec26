@@ -24,6 +24,21 @@ class PylonDiagnosticReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class CameraCapabilityReport:
+    serial: str
+    model: str
+    pixel_formats: list[str]
+    width: dict[str, Any]
+    height: dict[str, Any]
+    acquisition_frame_rate: dict[str, Any]
+    device_info: dict[str, Any]
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def inspect_pylon() -> PylonDiagnosticReport:
     try:
         import pypylon.pylon as pylon
@@ -71,6 +86,61 @@ def inspect_pylon() -> PylonDiagnosticReport:
         devices=devices,
         error=error,
     )
+
+
+def inspect_camera_capabilities(serial: str | None = None) -> CameraCapabilityReport:
+    try:
+        import pypylon.pylon as pylon
+    except Exception as exc:
+        return CameraCapabilityReport(
+            serial=serial or "",
+            model="",
+            pixel_formats=[],
+            width={},
+            height={},
+            acquisition_frame_rate={},
+            device_info={},
+            error=f"Could not import pypylon.pylon: {exc!r}",
+        )
+
+    camera = None
+    try:
+        factory = pylon.TlFactory.GetInstance()
+        devices = list(factory.EnumerateDevices())
+        device = _select_device(devices, serial)
+        camera = pylon.InstantCamera(factory.CreateDevice(device))
+        camera.Open()
+        node_map = camera.GetNodeMap()
+        device_info = _info_to_dict(device)
+        return CameraCapabilityReport(
+            serial=_safe_info_value(device, "GetSerialNumber"),
+            model=_safe_info_value(device, "GetModelName"),
+            pixel_formats=_enum_symbolics(node_map, "PixelFormat"),
+            width=_node_limits(node_map, "Width"),
+            height=_node_limits(node_map, "Height"),
+            acquisition_frame_rate=_first_node_limits(
+                node_map,
+                ("AcquisitionFrameRate", "AcquisitionFrameRateAbs"),
+            ),
+            device_info=device_info,
+        )
+    except Exception as exc:
+        return CameraCapabilityReport(
+            serial=serial or "",
+            model="",
+            pixel_formats=[],
+            width={},
+            height={},
+            acquisition_frame_rate={},
+            device_info={},
+            error=repr(exc),
+        )
+    finally:
+        try:
+            if camera is not None and camera.IsOpen():
+                camera.Close()
+        except Exception:
+            pass
 
 
 def _inspect_interfaces(factory: Any, tl_info: Any) -> list[dict[str, Any]]:
@@ -142,3 +212,65 @@ def _safe_info_value(info: Any, method_name: str) -> str:
         return str(getattr(info, method_name)())
     except Exception:
         return ""
+
+
+def _select_device(devices: list[Any], serial: str | None) -> Any:
+    if not devices:
+        raise RuntimeError("No Basler devices found.")
+    if serial:
+        for device in devices:
+            if _safe_info_value(device, "GetSerialNumber") == serial:
+                return device
+        raise RuntimeError(f"Basler serial {serial!r} not found.")
+    return devices[0]
+
+
+def _enum_symbolics(node_map: Any, node_name: str) -> list[str]:
+    try:
+        node = node_map.GetNode(node_name)
+        return [str(item) for item in node.Symbolics]
+    except Exception:
+        return []
+
+
+def _first_node_limits(node_map: Any, node_names: tuple[str, ...]) -> dict[str, Any]:
+    for node_name in node_names:
+        limits = _node_limits(node_map, node_name)
+        if limits:
+            return limits
+    return {}
+
+
+def _node_limits(node_map: Any, node_name: str) -> dict[str, Any]:
+    try:
+        node = node_map.GetNode(node_name)
+    except Exception:
+        return {}
+    if node is None:
+        return {}
+    result: dict[str, Any] = {}
+    for key, method_name in (("value", "GetValue"), ("min", "GetMin"), ("max", "GetMax"), ("increment", "GetInc")):
+        method = getattr(node, method_name, None)
+        if method is None:
+            continue
+        try:
+            result[key] = method()
+        except Exception:
+            pass
+    value = _float_or_none(result.get("value"))
+    minimum = _float_or_none(result.get("min"))
+    maximum = _float_or_none(result.get("max"))
+    if value is not None:
+        in_range = (minimum is None or value >= minimum) and (maximum is None or value <= maximum)
+        result["value_in_range"] = in_range
+        result["safe_value"] = result.get("value") if in_range else result.get("max", result.get("value"))
+    return result
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
