@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0rc2 - 2026-08-14
+
+- Added typed metadata v2 with subject weight, postnatal day/P0 semantics, project/protocol/assay identifiers, experimenter/run identifiers, validated custom fields, and a published JSON Schema.
+- Added UTC, UUID-backed project/subject/session folder naming plus recursive CSV/JSONL session indexing for portable analysis.
+- Bound approvals to both hardware/software and resolved camera/writer/profile/preview fingerprints, with an enforced validated maximum duration and three passing repetitions at that duration.
+- Added queue tail-growth, thermal, storage, and combined health gates; critical disk or internal-camera temperature conditions now request a safe stop.
+- Added read-only CXP qualification planning with exact repeated-case storage budgets and GUI confirmation before sweeps longer than 30 seconds.
+- Added task-quality evidence records as a lock requirement for lossy CXP profiles.
+- Prepared all three CXP configs for 30/60-second repeated rollover qualification; lossless is preview-off first, while near-lossless and compact modes qualify preview on and off independently.
+- Curated package data explicitly, added a reproducible Conda/Tk environment, expanded Windows CI to Python 3.10-3.12, and added a release-file audit manifest.
+- Pinned the verified Windows GUI runtime to Python 3.11.13 / Tk 8.6.14 after Tcl/Tk 8.6.15 failed initialization in the target Conda environment.
+
 ## 0.2.0rc1 - 2026-08-14
 
 - Fixed integrated setup preview starvation caused by including camera startup latency in cumulative FPS shedding; Mono8 preview now uses downsampled shared memory.

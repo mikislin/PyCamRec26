@@ -27,7 +27,7 @@ def main() -> int:
 
     rows = list(csv.DictReader(csv_path.open(newline="", encoding="utf-8")))
     if args.passes_only:
-        rows = [row for row in rows if _truthy(row.get("scientific_pass"))]
+        rows = [row for row in rows if _truthy(row.get("experiment_ready"))]
     if args.failures_only:
         rows = [row for row in rows if not _truthy(row.get("qc_pass"))]
     if args.evidence_ready_only:
@@ -48,8 +48,13 @@ def main() -> int:
 def _print_table(rows: list[dict[str, str]]) -> None:
     columns = [
         ("case_id", "case"),
+        ("repeat", "rep"),
         ("acquisition_pass", "acq"),
         ("qc_pass", "qcpass"),
+        ("queue_growth_pass", "qstable"),
+        ("health_pass", "health"),
+        ("metadata_complete", "metadata"),
+        ("profile_approval_pass", "approved"),
         ("evidence_ready", "evidence"),
         ("experiment_ready", "ready"),
         ("qc_status", "qc"),
@@ -74,8 +79,13 @@ def _print_table(rows: list[dict[str, str]]) -> None:
         formatted.append(
             {
                 "case": row.get("case_id", ""),
+                "rep": _fmt_int(row.get("repeat")),
                 "acq": "yes" if _truthy(row.get("acquisition_pass")) else "no",
                 "qcpass": "yes" if _truthy(row.get("qc_pass")) else "no",
+                "qstable": "yes" if _truthy(row.get("queue_growth_pass")) else "no",
+                "health": "yes" if _truthy(row.get("health_pass")) else "no",
+                "metadata": "yes" if _truthy(row.get("metadata_complete")) else "no",
+                "approved": "yes" if _truthy(row.get("profile_approval_pass")) else "no",
                 "evidence": "yes" if _truthy(row.get("evidence_ready")) else "no",
                 "ready": "yes" if _truthy(row.get("experiment_ready")) else "no",
                 "qc": row.get("qc_status", ""),
