@@ -1,12 +1,21 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
 build/
 dist/
 
 .pycamrec_gui/
 SSD_sessions/
 D_PyCamRecSessions/
+validation_sweeps/
+configs/generated/
+configs/approved/
+configs_legacy/
+campy/
+campy_review_pycamrec_plan.md
 tmp*/
 *.log
 *.avi
@@ -15,6 +24,9 @@ tmp*/
 *.pgm
 *.ppm
 *.raw
+*.framemd5
+*.part.*
+stop_*.txt
 
 .env
 .venv/

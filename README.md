@@ -1,94 +1,238 @@
 # PyCamRec
 
-PyCamRec is the focused Basler acquisition layer started from the CamPy (https://github.com/ksseverson57/campy).
+PyCamRec is a Windows-first scientific recorder for high-speed Basler cameras. It preserves owned frame bytes, camera block IDs and timestamps, writes finalized MP4 segments through FFmpeg/NVENC, records experiment metadata, and produces independent acquisition, QC, pixel-fidelity, and experiment-readiness results.
 
-Current implementation status:
-- Basler-only, single-camera recorder.
-- Loads and validates the supplied `.pfs`.
-- Validates serial, frame size, pixel format, and frame rate.
-- Copies each frame into owned bytes before releasing the pylon grab result.
-- Uses a bounded queue and aborts if the writer cannot keep up.
-- Writes continuous `frames.csv` metadata during acquisition.
-- Writes segmented FFmpeg output into `segments/`.
-- Writes `session.json`, copied `.pfs`, `segments.csv`, and `events.jsonl`.
+Repository: [github.com/mikislin/PyCamRec26](https://github.com/mikislin/PyCamRec26)
 
-Run once a Python environment with `pypylon`, `numpy`, and `PyYAML` is active.
-For the pylon Viewer 7.5, use `pypylon==4.0.0`; that release matches pylon 7.5 on Windows/Linux.
+## Current readiness
+
+Version `0.2.0rc1` is **engineering-ready, not yet approved for scientific experiments on the current CXP system**. Built-in profiles describe encoder intent and always say `requires_hardware_validation`; approval lives in a generated config tied to one evidence fingerprint and preview mode.
+
+Latest supplied CXP evidence for Mono8 2464x2064 at 200 fps:
+
+- 30 s, preview off: 199.10 fps, queue 85/1024, exact sampled pixels matched.
+- 60 s, preview off: 196.14 fps, queue 586/1024, exact sampled pixels matched, but the queue exceeded the 25% lock margin.
+- Preview on: 150-156 fps and 41-78% queue use; real-time QC failed.
+- Lossless output: approximately 3.7-4.0 Gbps, or 28-30 GB/min.
+- Observed camera temperature: approximately 57-59 C, above the default 40 C warning threshold.
+
+Those sessions did not exercise MP4 rollover, used the older software fingerprint, and had incomplete experiment metadata. They remain useful engineering evidence but cannot lock the revised profile.
+
+Current compact-profile engineering smoke on the attached CXP camera (2026-08-14): 10 seconds produced 2,000/2,000 frames, FFprobe reported 2,000 frames at 2464x2064 and 200 fps, observed host rate was 199.99 fps, queue peaked at 108/1024, and the MP4 was 33,764,988 bytes at 27.02 Mbps. At the same rate, 60 seconds is approximately 202.6 MB. This short, single-segment, metadata-incomplete run validates the size/rate target only; it does not approve the profile for experiments.
+
+## Supported targets and default configs
+
+Top-level `configs/` contains exactly three defaults for each target camera. All produce MP4, use full frame, and default preview off.
+
+| Camera | Lossless | Near-lossless | CV-optimal / smallest default |
+|---|---|---|---|
+| Basler a2A2448-210cm CXP, 2464x2064 at 200 fps | `pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml`, 4000 Mbps estimate | `pycamrec_basler_a2A2448_cxp_mono8_near_lossless.yaml`, 400 Mbps | `pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml`, 27 Mbps / about 200 MB per minute |
+| Basler acA1300-200uc USB, 1280x1024 at the current PFS rate of 80 fps | `pycamrec_basler_acA1300_usb_mono8_lossless.yaml`, 900 Mbps estimate | `pycamrec_basler_acA1300_usb_mono8_near_lossless.yaml`, 400 Mbps | `pycamrec_basler_acA1300_usb_mono8_cv_optimal.yaml`, 100 Mbps |
+
+The USB defaults intentionally use the rate in the supplied PFS and prior evidence. Detect capabilities and revalidate before raising it toward the camera's nominal maximum. “Near-lossless” and “CV-optimal” are lossy; only profiles declaring `pixel_fidelity: lossless...` require and can pass exact source-hash comparison. The 27 Mbps CXP profile is deliberately aggressive: 27 megabits/s is about 202.5 decimal MB (193 MiB) per 60 seconds before small MP4 overhead. Validate detection/tracking accuracy on representative scenes before experiment use.
+
+Raw Bayer8 and RGB8/BGR8 are supported through onboarding. Bayer8 can use the one-byte lossless luma path and be debayered offline. RGB/BGR to yuv420p MP4 is color-converted and lossy, so it must not claim exact color fidelity.
+
+## Windows environment
+
+The tested interpreter is:
+
+```text
+C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe
+```
+
+PowerShell setup:
 
 ```powershell
-pip uninstall -y pypylon
-pip install pypylon==4.0.0
+$PY = 'C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe'
+& $PY -m pip install -e '.[basler,preview,test]'
+& $PY -m pycamrec devices
+& $PY -m pycamrec profiles
 ```
 
-The current user-facing configs are profile based. Provide the duration from the command line:
+Windows CMD setup:
+
+```bat
+set "PY=C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe"
+"%PY%" -m pip install -e .[basler,preview,test]
+"%PY%" -m pycamrec devices
+"%PY%" -m pycamrec profiles
+```
+
+The supplied configs point to the local FFmpeg build under `C:\ffmpeg\...\bin`. Change both `writer.ffmpeg_path` and `writer.ffprobe_path` if that installation moves. `pypylon==4.0.0` is the declared Basler extra for the current environment.
+
+Before relying on the desktop GUI, verify that the environment's Tk runtime can create a window:
 
 ```powershell
-python -m pycamrec preflight configs/pycamrec_basler_a2A2448_profile_long_lossy.yaml --60
-python -m pycamrec record configs/pycamrec_basler_a2A2448_profile_long_lossy.yaml --60
-python -m pycamrec report D:\PyCamRecSessions\<session_folder>
+& $PY -c "import tkinter as tk; root = tk.Tk(); root.withdraw(); root.destroy(); print('Tk OK')"
 ```
 
-Before scientific recording, fill the `experiment:` block in the selected profile config. Fields default to `UNSPECIFIED` on purpose; PyCamRec never reuses previous animal/session values. Recording refuses incomplete metadata by default; for engineering-only tests, pass `--allow-unspecified-metadata`. Preflight and report also flag missing fields. `--fail-on-warning` is stricter than normal scientific mode and will also stop on expected warnings such as the PFS chunk-mode notice.
-
-```yaml
-experiment:
-  animal_id: "UNSPECIFIED"
-  dob: "UNSPECIFIED"
-  test_assay_name: "UNSPECIFIED"
-  genotype: "UNSPECIFIED"
-  experimental_group: "UNSPECIFIED"
-  sex: "UNSPECIFIED"
-  experimentator: "UNSPECIFIED"
-  project_protocol: "UNSPECIFIED"
-  camera_profile_path: "UNSPECIFIED"
-  notes: ""
+```bat
+"%PY%" -c "import tkinter as tk; root = tk.Tk(); root.withdraw(); root.destroy(); print('Tk OK')"
 ```
 
-Each session writes both machine-readable `session.json` and human-readable `experiment_metadata.json`. The experiment metadata file includes the fixed fields plus automatic capture of date/time, computer name, camera serial, CXP interface card, PFS hash, camera settings, recording profile version, PyCamRec version/git commit when available, disk path/free space, and camera temperature.
+If this reports that no usable `init.tcl` can be found, repair the Conda environment before using the GUI; this is an interpreter/Tcl installation failure rather than a recorder fallback condition. From PowerShell or CMD:
 
-The validated long-recording ladder uses the long lossy profile:
+```text
+conda install -n pycamrec --force-reinstall "python=3.11" "tk=8.6"
+```
+
+Re-run the Tk check and then the PyCamRec test suite. Do not substitute an interpreter without the Basler, FFmpeg, and validation dependencies for scientific recording.
+
+## Preflight, GUI, and recording
+
+PowerShell:
 
 ```powershell
-python -m pycamrec record configs/pycamrec_basler_a2A2448_profile_long_lossy.yaml --600
-python -m pycamrec record configs/pycamrec_basler_a2A2448_profile_long_lossy.yaml --1800
-python -m pycamrec record configs/pycamrec_basler_a2A2448_profile_long_lossy.yaml --7200
+$PY = 'C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe'
+& $PY -m pycamrec preflight configs\pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml --duration-s 30
+& $PY -m pycamrec gui
+& $PY -m pycamrec record configs\pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml --duration-s 30
 ```
 
-Built-in recording profiles can be listed with:
+Windows CMD:
+
+```bat
+set "PY=C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe"
+"%PY%" -m pycamrec preflight configs\pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml --duration-s 30
+"%PY%" -m pycamrec gui
+"%PY%" -m pycamrec record configs\pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml --duration-s 30
+```
+
+Fill every `experiment:` field before a scientific run. For an engineering-only test, append `--allow-unspecified-metadata`; that run can pass acquisition and QC, but it cannot be experiment-ready or lock a profile.
+
+Safe stop behavior:
+
+- In the GUI, use **Stop safely**. It creates a stop file, stops acquisition, drains queued frames, closes the current MP4, flushes metadata, and releases the camera.
+- In a terminal, press Ctrl-C once and wait for the finalization message.
+- A `.part.mp4` file, a finalization event, or a missing session summary makes finalization fail.
+- The supplied CXP PFS uses `BslAcquisitionStopMode CompleteExposure` so an in-flight exposure completes during stop.
+
+## Storage and temperature safety
+
+The GUI and preflight use `writer.expected_bitrate_mbps` from the camera config before any generic profile estimate. They show requested output size, free-space margin, and approximate duration at the target rate. Health checks read free space and camera temperature every 10 seconds, not only at segment boundaries.
+
+For CXP lossless, plan for **30 GB/min**:
+
+- 30 s is about 15 GB.
+- 60 s is about 30 GB.
+- 10 min is about 300 GB.
+
+Do not start a CXP lossless sweep longer than 30 seconds until the expected total has been checked against free space with at least a 20% reserve. Stop and allow cooling when temperature warnings appear; the latest 57-59 C observation is not an approved experiment condition.
+
+## Scientific gates
+
+The report no longer collapses unrelated checks into one `scientific_pass` label.
+
+| Field | Meaning |
+|---|---|
+| `acquisition_pass` | Session finalized cleanly; frames.csv, segments.csv, expected count, FFprobe count, block IDs, and detected drops agree. |
+| `qc_pass` | Acquisition passes, observed rate is at least 98% of expected, and queue stays below 90%. |
+| `pixel_pass` | For a lossless claim, decoded gray/raw-mosaic hashes match real camera source hashes. Timing QC cannot change this result. |
+| `metadata_pass` | All fixed experiment fields are present. |
+| `evidence_ready` | QC, required pixel evidence, and metadata pass; this can be considered for a profile lock. |
+| `profile_approval_pass` | The config is locked to the exact current evidence fingerprint and intended preview mode. |
+| `experiment_ready` | Evidence is ready and the pre-existing profile approval matches. |
+
+The evidence fingerprint includes camera/model/serial/interface, frame geometry and rate, PFS SHA-256, host and Python, pypylon, FFmpeg version/path, GPU and NVIDIA driver, PyCamRec version, Git commit, and dirty state. A change invalidates a lock before acquisition begins.
+
+Reports for sessions that are still being written return `qc.status: in_progress`; the GUI does not label them frame-integrity failures.
+
+## Hardware validation and profile locking
+
+Validation automatically shortens each case's segment length to at most half the duration, so every successful case must roll over once and then finalize the last MP4. Source hashes capped with `--source-frame-hash-max-frames` are distributed from the beginning through the end of the planned session. Limited decoding also samples across the session and always includes source-hashed frames.
+
+30-second CXP lossless validation in PowerShell:
 
 ```powershell
-python -m pycamrec profiles
+$PY = 'C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe'
+& $PY -m pycamrec validation-sweep configs\pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml --durations 30 --preview both --preview-width 512 --preview-fps 10 --verify-session-pixels --pixel-max-decode-frames 1000 --source-frame-hash-every 10 --source-frame-hash-max-frames 100 --require-complete-metadata
 ```
 
-Launch the Windows desktop app with:
+The equivalent CMD command:
+
+```bat
+set "PY=C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe"
+"%PY%" -m pycamrec validation-sweep configs\pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml --durations 30 --preview both --preview-width 512 --preview-fps 10 --verify-session-pixels --pixel-max-decode-frames 1000 --source-frame-hash-every 10 --source-frame-hash-max-frames 100 --require-complete-metadata
+```
+
+The base config must contain complete experiment metadata for that command. A lock recommendation is emitted separately for preview off and preview on. Locking requires every case in that mode to pass acquisition, rollover/finalization, QC, lossless pixel evidence when applicable, metadata, one fingerprint, and queue use below 25%.
+
+Create a separate approved config only after the summary recommends a lock:
 
 ```powershell
-python -m pycamrec gui
+& $PY -m pycamrec lock-profile configs\pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml validation_sweeps\YYYYMMDD_HHMMSS\validation_summary.json --preview-mode off --output configs\approved\a2A2448_cxp_mono8_lossless_approved.yaml
 ```
 
-The desktop app has tabs for device status, recording setup, experiment metadata, live preview controls, recording monitor output, and report browsing. It writes a run-specific config into `.pycamrec_gui/` so the three user-facing profile YAMLs stay clean and continue to default metadata fields to `UNSPECIFIED`. The Stop safely button creates a run-specific stop file instead of sending a console interrupt, so PyCamRec can drain frames, close the segment, write metadata, and release the camera.
+```bat
+"%PY%" -m pycamrec lock-profile configs\pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml validation_sweeps\YYYYMMDD_HHMMSS\validation_summary.json --preview-mode off --output configs\approved\a2A2448_cxp_mono8_lossless_approved.yaml
+```
 
-The GUI uses a three-panel layout: left-side settings/report tabs, a preallocated right-side live preview panel, and a bottom command-output log. GUI preview is integrated into that panel through a downsampled shared-memory grayscale frame buffer plus a tiny `.pycamrec_gui/latest_preview.json` status sidecar; it does not open a separate OpenCV window. The GUI auto-fits that image when the window is maximized or resized. The default GUI preview target is 512 pixels wide at 20 fps, and preview updates are dropped under writer queue pressure. Use wider preview, such as 800 pixels, for setup/alignment checks rather than final timing validation.
+`configs/approved/`, `configs/generated/`, and `validation_sweeps/` are intentionally ignored because they contain hardware/session-specific evidence and local paths.
 
-Top-level `configs/` contains only the three user-facing profile configs:
+## Camera onboarding and color modes
+
+Detect the attached camera and generate a reviewable candidate. CXP Mono8 now selects the CXP lossless profile and 4000 Mbps estimate, never the USB profile.
+
+PowerShell Bayer example for the USB camera:
 
 ```powershell
-python -m pycamrec preflight configs/pycamrec_basler_a2A2448_profile_long_lossy.yaml --60
-python -m pycamrec preflight configs/pycamrec_basler_a2A2448_profile_near_lossless.yaml --600
-python -m pycamrec preflight configs/pycamrec_basler_a2A2448_profile_lossless.yaml --30
+$PY = 'C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe'
+& $PY -m pycamrec camera-capabilities --serial 24188001
+& $PY -m pycamrec make-camera-config configs\pycamrec_basler_acA1300_usb_mono8_lossless.yaml --camera-make basler_usb --serial 24188001 --pfs-path acA1300-200uc_24188001.pfs --pixel-format BayerBG8 --expected-fps 80 --width 1280 --height 1024 --output configs\generated\acA1300_bayer8_candidate.yaml
 ```
 
-Live preview is optional and deliberately best-effort. Recording frames always go to the writer queue first; preview receives only the latest sampled frame and silently drops preview updates if display cannot keep up. For the GUI sink, the recorder publishes a sampled raw Mono8 frame and per-frame status into shared memory, while the GUI process handles preview downsampling/display. A tiny JSON sidecar is used only to advertise the shared-memory buffer name and shape to the GUI.
+CMD:
+
+```bat
+set "PY=C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe"
+"%PY%" -m pycamrec camera-capabilities --serial 24188001
+"%PY%" -m pycamrec make-camera-config configs\pycamrec_basler_acA1300_usb_mono8_lossless.yaml --camera-make basler_usb --serial 24188001 --pfs-path acA1300-200uc_24188001.pfs --pixel-format BayerBG8 --expected-fps 80 --width 1280 --height 1024 --output configs\generated\acA1300_bayer8_candidate.yaml
+```
+
+The GUI's Mono8 setup preview uses downsampled shared memory; Bayer/RGB setup preview keeps raw pixels so the GUI can render color correctly. Setup preview is never hidden by recording-oriented FPS shedding. Recording preview uses a latest-frame-only, strided shared-memory image, one OpenCV thread, a 10 fps default, and rolling-rate/queue-based load shedding. Preview evidence is still mode-specific.
+
+The 2026-08-14 attached-camera GUI smoke rendered 83 setup-preview frames without preview errors, compared with only 2-6 frames before the cumulative-startup-rate fix.
+
+## Session artifacts
+
+Each session contains:
+
+- finalized `segments/segment_*.mp4` files;
+- `frames.csv`, including block IDs, camera/host timestamps, queue depth, gap estimates, and optional source hashes;
+- `segments.csv` and `events.jsonl`;
+- `session.json`, `experiment_metadata.json`, and `analysis_manifest.json`;
+- the exact copied PFS;
+- `pixel_verification.json` after real-session pixel verification.
+
+Inspect a completed session:
 
 ```powershell
-pip install opencv-python
-python -m pycamrec record configs/pycamrec_basler_a2A2448_profile_near_lossless.yaml --60 --preview --allow-unspecified-metadata
-python -m pycamrec record configs/pycamrec_basler_a2A2448_profile_near_lossless.yaml --60 --preview --preview-width 800 --preview-fps 30
+& $PY -m pycamrec report D:\PyCamRecSessions\SESSION_FOLDER
+& $PY -m pycamrec verify-session-pixels D:\PyCamRecSessions\SESSION_FOLDER --max-decode-frames 1000
 ```
 
-Close only the standalone OpenCV preview window with `q` or Esc. Stop recording from the terminal with Ctrl-C, or from the GUI with Stop safely, so PyCamRec can drain the writer queue, close the segment, flush metadata, and release the camera.
+```bat
+"%PY%" -m pycamrec report D:\PyCamRecSessions\SESSION_FOLDER
+"%PY%" -m pycamrec verify-session-pixels D:\PyCamRecSessions\SESSION_FOLDER --max-decode-frames 1000
+```
 
-During recordings PyCamRec prints a health line after each segment closes. It records free disk space and camera temperature in `events.jsonl`, warning when the profile's free-space guard is crossed or camera temperature is above 40 C.
+## Development checks
 
-To interrupt a long run, press Ctrl-C once and wait for PyCamRec to print that the session was finalized and the camera was released. It will stop acquisition, drain queued frames, close the current video segment, flush metadata, and write the session summary.
+The core suite does not require a camera. It includes MP4 rollover/finalization through the installed FFmpeg when available.
 
+```powershell
+$PY = 'C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe'
+& $PY -m compileall -q pycamrec tests
+& $PY -W error::ResourceWarning -m unittest discover -s tests -v
+& $PY -m pycamrec validation-sweep configs\pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml --durations 30 --preview both --dry-run
+```
+
+```bat
+set "PY=C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe"
+"%PY%" -m compileall -q pycamrec tests
+"%PY%" -W error::ResourceWarning -m unittest discover -s tests -v
+"%PY%" -m pycamrec validation-sweep configs\pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml --durations 30 --preview both --dry-run
+```
+
+PyCamRec is released under the MIT License.
