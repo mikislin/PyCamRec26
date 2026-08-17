@@ -8,16 +8,16 @@ Repository: [github.com/mikislin/PyCamRec26](https://github.com/mikislin/PyCamRe
 
 Version `0.2.0rc2` is **engineering-ready, not yet approved for scientific experiments on the current CXP system**. A built-in profile is a candidate definition, not an approval. Approval lives in a separate locked config tied to hardware/software evidence, resolved profile settings, preview mode, and validated maximum duration. The GUI presents profile qualification, current recording setup, and metadata readiness as independent states.
 
-Latest compact CXP engineering evidence for Mono8 2464x2064 at 200 fps, collected on clean commit `cfa427b` on 2026-08-14:
+Latest compact CXP engineering evidence for Mono8 2464x2064 at 200 fps, collected on 2026-08-17:
 
 - 12/12 acquisition and QC passes across 30- and 60-second runs, three repeats per duration, preview on and off.
 - Exact recorded, expected, and FFprobe frame counts; zero block-ID gaps and zero detected drops.
-- Minimum observed rate 199.713 fps (99.856% of requested); worst queue 125/1024 (12.21%).
+- Minimum observed rate 199.686 fps (99.843% of requested); worst queue 131/1024 (12.79%).
 - Every run rolled over to two MP4 segments and finalized without residual `.part` files.
 - 27.009 Mbps weighted output; 60-second MP4 totals were 202.56-202.66 decimal MB.
-- Maximum internal camera temperature 61.312 C during the sweep.
+- Maximum internal camera temperature 58.562 C during the sweep.
 
-Preview-on performance therefore passes the current engineering timing and queue gates. The evidence is not lockable because it used unspecified experiment metadata and the placeholder failing task-quality record. Any code/configuration change after `cfa427b`, including this GUI/naming revision, changes the software or resolved-profile fingerprint and requires a new qualification run before locking.
+Preview-on and preview-off performance both pass the acquisition, metadata, rollover, health, timing, and preferred queue-margin gates. The only remaining scientific gate is real downstream task-quality evidence for the aggressive 27 Mbps compression. PyCamRec must not infer tracking, segmentation, or event accuracy from an acquisition sweep. Any code/configuration or camera/PFS/GPU/driver/host change after that evidence changes a fingerprint and requires a new qualification run before locking.
 
 ## Supported targets and default configs
 
@@ -225,9 +225,9 @@ GUI qualification workflow:
 1. Complete **Recording metadata**; qualification evidence with unspecified metadata cannot be locked.
 2. On **Profile qualification**, select the candidate YAML and matching camera PFS, then use **Detect camera caps**.
 3. Set the intended durations, preview mode, required repetitions, and rollover segment length. Preview on and off are separate approvals.
-4. For a lossy profile, select a completed task-quality record; for a lossless profile, configure source/pixel hashing.
-5. Use **Run qualification sweep**. Exit code 0 means the sweep completed, not that it passed; review `validation_summary.json`.
-6. If the summary recommends a lock, use **Create locked config...**, choose its preview mode, and select the resulting config for experiments.
+4. For a lossless profile, configure source/pixel hashing. For a lossy profile, an existing task-quality JSON is optional; the sweep creates or updates a working record automatically.
+5. Use **Run qualification sweep**. The sweep writes `validation_summary.json`, `task_quality_record.json`, and `profile_status.json` in one timestamped folder. Exit code 0 means acquisition completed, not that the lossy profile is approved.
+6. Use **Finalize & create both approved YAMLs...**. For a lossy profile, select an immutable reference dataset/archive/manifest and enter the three independently measured task metrics. PyCamRec hashes the artifact and computes the result from the thresholds. When every gate passes, it updates the summary/status and creates both preview-off and preview-on YAMLs in one action.
 7. Run **Preflight** from **Setup & Record**. Startup still verifies the live camera/PFS/GPU/driver/host/software fingerprint.
 
 Print the complete cases, exact command, and disk budget without recording:
@@ -256,7 +256,23 @@ CMD:
 
 The base config must contain complete experiment metadata. A lock recommendation is emitted separately for preview off and preview on. Lossless is initially qualified preview-off only. Near-lossless and compact CXP configs plan both modes independently.
 
-Lossy profiles additionally require a predefined scientific task-quality record. Copy `qualification/task_quality_record.template.json`, bind it to the immutable reference dataset and current profile version, record predefined tracking/segmentation/event thresholds and results, and set `status` to `pass` only when all criteria pass. Supply it with `--task-quality-record PATH.json`; its SHA-256 is copied into the approval certificate.
+Lossy profiles additionally require predefined scientific task-quality criteria. The sweep creates `task_quality_record.json` beside its summary (or updates the working JSON supplied with `--task-quality-record`) and binds it to the profile, sweep counts, preview modes, and hardware fingerprint. It remains `pending` until real task metrics and an immutable reference-artifact hash are present. Do not edit `status`: the app calculates `pending`, `fail`, or `pass` from every numeric `*_min`/`*_max` criterion.
+
+Finalize a completed lossy sweep without rerunning the camera. Substitute the real evaluation artifact and measured results; the example numbers are not defaults or claims:
+
+```powershell
+$SUMMARY = 'validation_sweeps\YYYYMMDD_HHMMSS\validation_summary.json'
+$REFERENCE = 'D:\TaskValidation\cxp_27m_reference_v1.zip'
+& $PY -m pycamrec finalize-qualification configs\pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml $SUMMARY --reference-dataset $REFERENCE --tracking-median-error-px 0.80 --segmentation-iou 0.96 --event-f1 0.97 --approved-dir configs\approved
+```
+
+```bat
+set "SUMMARY=validation_sweeps\YYYYMMDD_HHMMSS\validation_summary.json"
+set "REFERENCE=D:\TaskValidation\cxp_27m_reference_v1.zip"
+"%PY%" -m pycamrec finalize-qualification configs\pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml "%SUMMARY%" --reference-dataset "%REFERENCE%" --tracking-median-error-px 0.80 --segmentation-iou 0.96 --event-f1 0.97 --approved-dir configs\approved
+```
+
+The command reads the sweep-local task record by default, updates `validation_summary.json` while preserving `validation_summary.acquisition.json`, writes `profile_status.json`, and creates `*_preview_off_approved.yaml` plus `*_preview_on_approved.yaml`. It refuses partial metrics, failed thresholds, missing preview-mode evidence, profile mismatches, or existing destination files.
 
 Create a separate approved config only after the summary recommends a lock:
 
@@ -283,8 +299,9 @@ Copy-Item configs\pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml $CUSTOM
 # Edit $CUSTOM: writer/output_args, expected_bitrate_mbps, qualification policy, and complete experiment metadata.
 & $PY -m pycamrec preflight $CUSTOM --duration-s 30
 & $PY -m pycamrec qualification-plan $CUSTOM
-& $PY -m pycamrec validation-sweep $CUSTOM --durations 30,60 --preview both --repeats 3 --required-passing-repeats 3 --task-quality-record qualification\task_quality_record.json --require-complete-metadata
-& $PY -m pycamrec lock-profile $CUSTOM validation_sweeps\YYYYMMDD_HHMMSS\validation_summary.json --preview-mode on --output configs\approved\my_a2A2448_cxp_profile_preview_on.yaml
+& $PY -m pycamrec validation-sweep $CUSTOM --durations 30,60 --preview both --repeats 3 --required-passing-repeats 3 --require-complete-metadata
+$SUMMARY = 'validation_sweeps\YYYYMMDD_HHMMSS\validation_summary.json'
+& $PY -m pycamrec finalize-qualification $CUSTOM $SUMMARY --reference-dataset D:\TaskValidation\custom_profile_reference.zip --tracking-median-error-px 0.80 --segmentation-iou 0.96 --event-f1 0.97 --approved-dir configs\approved
 ```
 
 CMD example:
@@ -296,11 +313,12 @@ copy configs\pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml "%CUSTOM%"
 rem Edit %CUSTOM%: writer/output_args, expected_bitrate_mbps, qualification policy, and complete experiment metadata.
 "%PY%" -m pycamrec preflight "%CUSTOM%" --duration-s 30
 "%PY%" -m pycamrec qualification-plan "%CUSTOM%"
-"%PY%" -m pycamrec validation-sweep "%CUSTOM%" --durations 30,60 --preview both --repeats 3 --required-passing-repeats 3 --task-quality-record qualification\task_quality_record.json --require-complete-metadata
-"%PY%" -m pycamrec lock-profile "%CUSTOM%" validation_sweeps\YYYYMMDD_HHMMSS\validation_summary.json --preview-mode on --output configs\approved\my_a2A2448_cxp_profile_preview_on.yaml
+"%PY%" -m pycamrec validation-sweep "%CUSTOM%" --durations 30,60 --preview both --repeats 3 --required-passing-repeats 3 --require-complete-metadata
+set "SUMMARY=validation_sweeps\YYYYMMDD_HHMMSS\validation_summary.json"
+"%PY%" -m pycamrec finalize-qualification "%CUSTOM%" "%SUMMARY%" --reference-dataset D:\TaskValidation\custom_profile_reference.zip --tracking-median-error-px 0.80 --segmentation-iou 0.96 --event-f1 0.97 --approved-dir configs\approved
 ```
 
-For a lossless custom config, replace `--task-quality-record ...` with `--verify-session-pixels --pixel-max-decode-frames 1000 --source-frame-hash-every 10 --source-frame-hash-max-frames 100`. If both preview modes are intended, create two locked configs from the same passing summary, one with `--preview-mode on` and one with `--preview-mode off`. Select the resulting locked config in the GUI; selecting the original custom candidate does not carry approval forward.
+For a lossless custom config, add `--verify-session-pixels --pixel-max-decode-frames 1000 --source-frame-hash-every 10 --source-frame-hash-max-frames 100` to the sweep and omit task-metric arguments. `finalize-qualification` creates two configs only when the sweep contains passing evidence for both preview modes; use the lower-level `lock-profile` command when intentionally qualifying just one mode. Select the resulting locked config in the GUI; selecting the original custom candidate does not carry approval forward.
 
 After any completed run, create a persistent, non-overwriting JSON report:
 

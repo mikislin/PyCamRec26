@@ -2,6 +2,7 @@
 
 ## 0.2.0rc2 - 2026-08-14
 
+- Reworked qualification into a sweep-bound two-stage workflow: sweeps now create/update task-quality and profile-status JSON, task status is computed from finite metrics and thresholds, and one finalizer creates both preview-mode approved YAMLs without rerunning the camera.
 - Separated GUI profile qualification, current recording setup, and metadata readiness; removed the hard-coded stale CXP preview-failure banner in favor of certificate-derived preview coverage.
 - Added metadata JSON load/save, dependency-free DOB and weight timestamp calendar controls, Today/Now actions, typed custom-field shorthand, and hash-backed automatic run-index sequencing.
 - Made run indices manually overridable while keeping automatic-next as the default, and added per-check health-duration telemetry for qualification.
