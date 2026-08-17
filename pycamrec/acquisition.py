@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import queue
 import shutil
 import threading
 import time
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 
-from .basler_device import BaslerCamera, GrabbedFrame
+from .camera_backend import CameraBackend, GrabbedFrame, create_camera_backend
 from .metadata import FrameMetadata, MetadataWriter
+from .hardware import build_hardware_fingerprint, build_profile_fingerprint, evaluate_profile_approval
 from .preflight import PreflightReport
 from .preview import PreviewWorker
 from .schemas import PyCamRecConfig
@@ -41,6 +44,9 @@ class RecordingStats:
     queue_full_errors: int = 0
     health_checks: int = 0
     health_warnings: int = 0
+    health_critical_events: int = 0
+    last_health_check_duration_ms: float | None = None
+    max_health_check_duration_ms: float = 0.0
     last_free_space_gb: float | None = None
     last_camera_temperature_c: float | None = None
     writer_spool_enabled: bool = False
@@ -51,6 +57,8 @@ class RecordingStats:
     preview_frames_published: int = 0
     preview_frames_displayed: int = 0
     preview_frames_dropped: int = 0
+    preview_frames_shed_queue: int = 0
+    preview_frames_shed_fps: int = 0
     preview_error: str = ""
     started_perf_counter_ns: int = 0
     finished_perf_counter_ns: int = 0
@@ -78,10 +86,45 @@ class Recorder:
         self._stop_file_seen = False
         self._last_progress_print_at = 0.0
         self._progress_stop_event = threading.Event()
+        self._last_health_check_at = 0.0
 
     def run(self) -> RecordingStats:
-        with BaslerCamera(self.cfg.camera) as camera:
-            metadata = MetadataWriter(self.cfg, self.preflight, camera.device_info)
+        with create_camera_backend(self.cfg.camera) as camera:
+            evidence_fingerprint = build_hardware_fingerprint(
+                camera_config=asdict(self.cfg.camera),
+                device_info=camera.device_info,
+                pfs_sha256=self.preflight.pfs_sha256,
+                ffmpeg_path=self.cfg.writer.ffmpeg_path,
+                ffprobe_path=self.cfg.writer.ffprobe_path,
+                ffmpeg_version=self.preflight.ffmpeg_version,
+            )
+            profile_fingerprint = build_profile_fingerprint(
+                camera_config=asdict(self.cfg.camera),
+                writer_config=asdict(self.cfg.writer),
+                recording_profile=asdict(self.cfg.recording_profile),
+                preview_config=asdict(self.cfg.preview),
+            )
+            profile_approval = evaluate_profile_approval(
+                self.cfg.raw.get("approval") if isinstance(self.cfg.raw, dict) else {},
+                evidence_fingerprint_sha256=str(evidence_fingerprint.get("fingerprint_sha256") or ""),
+                profile_fingerprint_sha256=str(profile_fingerprint.get("fingerprint_sha256") or ""),
+                preview_enabled=self.cfg.preview.enabled,
+                duration_s=self.cfg.session.duration_s,
+            )
+            if profile_approval["locked"] and not profile_approval["approved"]:
+                raise RuntimeError(
+                    "Configured profile lock is invalid for this run: "
+                    + "; ".join(str(reason) for reason in profile_approval["reasons"])
+                    + ". Change approval.status back to requires_hardware_validation and revalidate."
+                )
+            metadata = MetadataWriter(
+                self.cfg,
+                self.preflight,
+                camera.device_info,
+                evidence_fingerprint=evidence_fingerprint,
+                profile_fingerprint=profile_fingerprint,
+                profile_approval=profile_approval,
+            )
             writer = FfmpegSegmentWriter(self.cfg, metadata.segments_dir)
             self.stats.last_camera_temperature_c = _safe_round_float(
                 camera.device_info.get("device_temperature_c"),
@@ -91,6 +134,7 @@ class Recorder:
                 source_width=self.cfg.camera.expected_width,
                 source_height=self.cfg.camera.expected_height,
                 source_fps=self.cfg.camera.expected_fps,
+                source_pixel_format=self.cfg.camera.expected_pixel_format,
                 queue_max_frames=self.cfg.writer.queue_max_frames,
                 session_dir=metadata.session_dir,
                 recording_profile_id=self.cfg.recording_profile.id,
@@ -138,7 +182,7 @@ class Recorder:
                     segment = writer.close()
                     if segment is not None:
                         metadata.append_segment(segment)
-                        self._record_segment_health(camera, metadata, segment.segment_id)
+                        self._record_segment_health(camera, metadata, segment.segment_id, reason="finalization")
                     self._record_writer_spool_stats(writer)
                 except Exception as exc:
                     finalization_error = exc
@@ -196,6 +240,8 @@ class Recorder:
         self.stats.preview_frames_published = int(summary["frames_published"])
         self.stats.preview_frames_displayed = int(summary["frames_displayed"])
         self.stats.preview_frames_dropped = int(summary["frames_dropped"])
+        self.stats.preview_frames_shed_queue = int(summary["frames_shed_queue"])
+        self.stats.preview_frames_shed_fps = int(summary["frames_shed_fps"])
         self.stats.preview_error = str(summary["error"])
         metadata.log_event("preview_summary", summary)
 
@@ -214,6 +260,9 @@ class Recorder:
             "free_space_gb": self.stats.last_free_space_gb,
             "camera_temperature_c": self.stats.last_camera_temperature_c,
             "dropped_detected": self.stats.dropped_detected,
+            "expected_fps": self.cfg.camera.expected_fps,
+            "queue_depth": self.frame_queue.qsize(),
+            "queue_capacity": self.cfg.writer.queue_max_frames,
         }
 
     def _publish_preview(self, packet: FramePacket) -> None:
@@ -252,7 +301,7 @@ class Recorder:
             flush=True,
         )
 
-    def _produce_frames(self, camera: BaslerCamera, metadata: MetadataWriter) -> None:
+    def _produce_frames(self, camera: CameraBackend, metadata: MetadataWriter) -> None:
         previous_block_id: int | None = None
         previous_timestamp_raw: int | None = None
         expected_delta_ns = int(round(1_000_000_000 / self.cfg.camera.expected_fps))
@@ -289,11 +338,15 @@ class Recorder:
                 previous_timestamp_raw = frame.camera_timestamp_raw
                 segment_id = frame_index // self.cfg.segment_frame_count
 
+                queue_depth = min(
+                    self.cfg.writer.queue_max_frames,
+                    self.frame_queue.qsize() + 1,
+                )
                 packet = FramePacket(
                     frame_index=frame_index,
                     frame=frame,
                     dropped_before_frame=dropped,
-                    queue_depth_after_enqueue=0,
+                    queue_depth_after_enqueue=queue_depth,
                     writer_segment_id=segment_id,
                 )
                 try:
@@ -305,17 +358,10 @@ class Recorder:
                         "Writer queue filled. Aborting to avoid dropped frames."
                     ) from exc
 
-                queue_depth = self.frame_queue.qsize()
+                queue_depth = max(queue_depth, self.frame_queue.qsize())
                 self.stats.max_queue_depth = max(self.stats.max_queue_depth, queue_depth)
                 if queue_depth >= int(self.cfg.writer.queue_max_frames * 0.90):
                     self.stats.queue_pressure_events += 1
-                packet = FramePacket(
-                    frame_index=packet.frame_index,
-                    frame=packet.frame,
-                    dropped_before_frame=packet.dropped_before_frame,
-                    queue_depth_after_enqueue=queue_depth,
-                    writer_segment_id=packet.writer_segment_id,
-                )
                 self.stats.frames_grabbed += 1
                 if frame.camera_block_id is not None:
                     self.stats.frames_with_block_id += 1
@@ -323,7 +369,6 @@ class Recorder:
                     self.stats.frames_with_camera_timestamp += 1
                 self.stats.dropped_detected += dropped
                 self._publish_preview(packet)
-                metadata.append_frame(_frame_metadata(packet))
                 if dropped:
                     metadata.log_event(
                         "frame_gap_detected",
@@ -358,7 +403,7 @@ class Recorder:
         writer: FfmpegSegmentWriter,
         metadata: MetadataWriter,
         producer: threading.Thread,
-        camera: BaslerCamera,
+        camera: CameraBackend,
     ) -> None:
         while producer.is_alive() or not self.frame_queue.empty():
             try:
@@ -368,11 +413,21 @@ class Recorder:
                     break
                 continue
             try:
+                metadata.append_frame(_frame_metadata(packet, self.cfg))
                 writer.write_frame(packet.frame_index, packet.frame.frame_bytes)
                 for segment in writer.pop_completed_segments():
                     metadata.append_segment(segment)
-                    self._record_segment_health(camera, metadata, segment.segment_id)
+                    self._record_segment_health(camera, metadata, segment.segment_id, reason="rollover")
                 self.stats.frames_written += 1
+                now = time.perf_counter()
+                if now - self._last_health_check_at >= self.cfg.camera.health_check_interval_s:
+                    self._record_segment_health(
+                        camera,
+                        metadata,
+                        packet.writer_segment_id,
+                        reason="periodic",
+                    )
+                    self._last_health_check_at = now
             except Exception as exc:
                 self.stats.error = repr(exc)
                 self.stop_event.set()
@@ -383,55 +438,81 @@ class Recorder:
 
     def _record_segment_health(
         self,
-        camera: BaslerCamera,
+        camera: CameraBackend,
         metadata: MetadataWriter,
         segment_id: int,
+        *,
+        reason: str,
     ) -> None:
+        health_check_started = time.perf_counter()
         disk_usage = shutil.disk_usage(metadata.session_dir)
         free_space_gb = disk_usage.free / (1024**3)
         temperature_c = camera.read_temperature_c()
         warnings = []
+        critical = []
         if free_space_gb < self.cfg.writer.min_free_space_gb:
-            warnings.append(
+            critical.append(
                 f"free space {free_space_gb:.1f} GiB below {self.cfg.writer.min_free_space_gb:.1f} GiB"
             )
         if temperature_c is not None and temperature_c > self.cfg.camera.temperature_warning_c:
             warnings.append(
                 f"camera temperature {temperature_c:.1f} C above {self.cfg.camera.temperature_warning_c:.1f} C"
             )
+        if temperature_c is not None and temperature_c >= self.cfg.camera.temperature_critical_c:
+            critical.append(
+                f"camera temperature {temperature_c:.1f} C reached critical "
+                f"{self.cfg.camera.temperature_critical_c:.1f} C"
+            )
 
+        health_check_duration_ms = (time.perf_counter() - health_check_started) * 1000.0
         self.stats.health_checks += 1
+        self.stats.last_health_check_duration_ms = round(health_check_duration_ms, 3)
+        self.stats.max_health_check_duration_ms = max(
+            self.stats.max_health_check_duration_ms,
+            round(health_check_duration_ms, 3),
+        )
         self.stats.last_free_space_gb = round(free_space_gb, 3)
         self.stats.last_camera_temperature_c = (
             round(temperature_c, 3) if temperature_c is not None else None
         )
-        if warnings:
-            self.stats.health_warnings += len(warnings)
+        self.stats.health_warnings += len(warnings)
+        self.stats.health_critical_events += len(critical)
 
-        status = "WARNING" if warnings else "OK"
+        status = "CRITICAL" if critical else "WARNING" if warnings else "OK"
         temperature_text = f"{temperature_c:.1f} C" if temperature_c is not None else "unknown"
         message = (
-            f"[PyCamRec] Segment {segment_id} health {status}: "
-            f"free={free_space_gb:.1f} GiB, camera_temp={temperature_text}"
+            f"[PyCamRec] Health {status}: segment={segment_id}, reason={reason}, "
+            f"free={free_space_gb:.1f} GiB, camera_temp={temperature_text}, "
+            f"check_ms={health_check_duration_ms:.1f}"
         )
-        if warnings:
-            message += " (" + "; ".join(warnings) + ")"
+        if warnings or critical:
+            message += " (" + "; ".join(critical + warnings) + ")"
         print(message, flush=True)
         metadata.log_event(
             "segment_health",
             {
                 "segment_id": segment_id,
+                "reason": reason,
                 "status": status.lower(),
                 "free_space_bytes": disk_usage.free,
                 "free_space_gb": round(free_space_gb, 3),
                 "camera_temperature_c": (
                     round(temperature_c, 3) if temperature_c is not None else None
                 ),
+                "check_duration_ms": round(health_check_duration_ms, 3),
                 "temperature_warning_c": self.cfg.camera.temperature_warning_c,
+                "temperature_critical_c": self.cfg.camera.temperature_critical_c,
                 "min_free_space_gb": self.cfg.writer.min_free_space_gb,
                 "warnings": warnings,
+                "critical": critical,
             },
         )
+        if critical:
+            metadata.log_event(
+                "health_critical_stop_requested",
+                {"segment_id": segment_id, "reason": reason, "critical": critical},
+            )
+            self.stop_event.set()
 
 
 def _detect_gap(
@@ -460,7 +541,7 @@ def _detect_gap(
     return max(block_gap, timestamp_gap)
 
 
-def _expected_timestamp_delta_raw(camera: BaslerCamera, expected_fps: float) -> int | None:
+def _expected_timestamp_delta_raw(camera: CameraBackend, expected_fps: float) -> int | None:
     if camera.timestamp_tick_frequency_hz in (None, 0):
         return None
     return int(round(camera.timestamp_tick_frequency_hz / expected_fps))
@@ -473,7 +554,7 @@ def _safe_round_float(value: object, digits: int = 3) -> float | None:
         return None
 
 
-def _frame_metadata(packet: FramePacket) -> FrameMetadata:
+def _frame_metadata(packet: FramePacket, cfg: PyCamRecConfig) -> FrameMetadata:
     frame = packet.frame
     return FrameMetadata(
         frame_index=packet.frame_index,
@@ -486,4 +567,36 @@ def _frame_metadata(packet: FramePacket) -> FrameMetadata:
         queue_depth_after_enqueue=packet.queue_depth_after_enqueue,
         writer_segment_id=packet.writer_segment_id,
         dropped_before_frame=packet.dropped_before_frame,
+        source_framemd5=_source_framemd5(cfg, packet.frame_index, frame.frame_bytes),
     )
+
+
+def _source_framemd5(cfg: PyCamRecConfig, frame_index: int, frame_bytes: bytes) -> str:
+    every = cfg.metadata.source_frame_hash_every
+    if frame_index not in _source_hash_frame_indices(
+        cfg.expected_total_frames,
+        every,
+        cfg.metadata.source_frame_hash_max_frames,
+    ):
+        return ""
+    return hashlib.md5(frame_bytes).hexdigest()
+
+
+@lru_cache(maxsize=128)
+def _source_hash_frame_indices(total_frames: int, every: int, max_frames: int) -> frozenset[int]:
+    """Return deterministic hash positions spanning the complete planned session."""
+
+    if total_frames <= 0 or every <= 0:
+        return frozenset()
+    candidates = range(0, total_frames, every)
+    candidate_count = (total_frames + every - 1) // every
+    if max_frames <= 0 or candidate_count <= max_frames:
+        return frozenset(candidates)
+    if max_frames == 1:
+        return frozenset({0})
+    last_candidate = candidate_count - 1
+    selected_slots = {
+        round(index * last_candidate / (max_frames - 1))
+        for index in range(max_frames)
+    }
+    return frozenset(slot * every for slot in selected_slots)

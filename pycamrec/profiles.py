@@ -1,4 +1,9 @@
-"""Built-in recording profiles for PyCamRec."""
+"""Built-in recording profiles for PyCamRec.
+
+Profiles describe encoder intent only. Hardware approval is deliberately kept in
+validation evidence because a camera, PFS, transport, GPU/driver, host, or
+software change invalidates an earlier result.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,8 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-PROFILE_VERSION = "2026-05-04"
+PROFILE_VERSION = "0.2.0rc2-2026-08-14"
+REQUIRES_HARDWARE_VALIDATION = "requires_hardware_validation"
 
 
 @dataclass(frozen=True)
@@ -31,186 +37,264 @@ class RecordingProfileDefinition:
         return data
 
 
-LONG_LOSSY_H264_250M = RecordingProfileDefinition(
-    id="long_lossy_h264_250m",
-    display_name="Long nonstop lossy H.264 250 Mbps",
-    version=PROFILE_VERSION,
-    compression="lossy_h264_nvenc",
-    pixel_fidelity="lossy",
-    validation_status="validated_2h_on_current_system",
-    tested_duration_s=7200.0,
-    max_duration_s=None,
-    enforce_max_duration=False,
-    expected_bitrate_mbps=250.0,
-    description=(
-        "Validated full-frame 200 fps profile for long nonstop recordings. "
-        "Frame continuity and timestamps are preserved; pixel values are H.264 lossy compressed."
-    ),
-    recommended_use="Long behavioral recordings where frame count and timing matter more than exact pixel intensity.",
-    writer_defaults={
+def _cbr_writer_defaults(bitrate_mbps: float, *, gop_frames: int) -> dict[str, Any]:
+    bitrate = f"{bitrate_mbps:g}M"
+    return {
         "mode": "compressed_nvenc",
         "segment_seconds": 120,
         "input_pix_fmt": "gray",
         "codec": "h264_nvenc",
-        "container": "avi",
+        "container": "mp4",
         "output_pix_fmt": "yuv420p",
-        "queue_max_frames": 512,
+        "queue_max_frames": 1024,
         "overwrite": False,
         "hash_segments": False,
-        "expected_bitrate_mbps": 250,
-        "min_free_space_gb": 10,
+        "expected_bitrate_mbps": bitrate_mbps,
+        "min_free_space_gb": 50,
+        "finalize_timeout_s": 300,
         "output_args": (
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p1",
-            "-tune",
-            "ull",
-            "-rc",
-            "cbr",
-            "-b:v",
-            "250M",
-            "-maxrate",
-            "250M",
-            "-bufsize",
-            "125M",
-            "-bf",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-            "-color_range",
-            "pc",
+            "-c:v", "h264_nvenc",
+            "-preset", "p1",
+            "-tune", "ull",
+            "-rc", "cbr",
+            "-b:v", bitrate,
+            "-maxrate", bitrate,
+            "-bufsize", f"{max(1.0, bitrate_mbps / 2):g}M",
+            "-bf", "0",
+            "-g", str(gop_frames),
+            "-surfaces", "64",
+            "-zerolatency", "1",
+            "-gpu", "0",
+            "-pix_fmt", "yuv420p",
+            "-color_range", "pc",
         ),
-    },
+    }
+
+
+def _lossless_writer_defaults(
+    expected_bitrate_mbps: float,
+    *,
+    segment_seconds: float,
+    gop_frames: int,
+) -> dict[str, Any]:
+    return {
+        "mode": "compressed_nvenc",
+        "segment_seconds": segment_seconds,
+        "input_pix_fmt": "gray",
+        "codec": "h264_nvenc",
+        "container": "mp4",
+        "output_pix_fmt": "yuv420p",
+        "queue_max_frames": 1024,
+        "overwrite": False,
+        "hash_segments": False,
+        "expected_bitrate_mbps": expected_bitrate_mbps,
+        "min_free_space_gb": 80,
+        "finalize_timeout_s": 300,
+        "output_args": (
+            "-c:v", "h264_nvenc",
+            "-preset", "p1",
+            "-tune", "lossless",
+            "-profile:v", "high",
+            "-rc", "constqp",
+            "-qp", "0",
+            "-bf", "0",
+            "-g", str(gop_frames),
+            "-surfaces", "64",
+            "-zerolatency", "1",
+            "-gpu", "0",
+            "-pix_fmt", "yuv420p",
+            "-color_range", "pc",
+        ),
+    }
+
+
+LONG_LOSSY_H264_250M = RecordingProfileDefinition(
+    id="long_lossy_h264_250m",
+    display_name="Legacy long H.264 NVENC 250 Mbps MP4",
+    version=PROFILE_VERSION,
+    compression="lossy_h264_nvenc",
+    pixel_fidelity="lossy",
+    validation_status=REQUIRES_HARDWARE_VALIDATION,
+    tested_duration_s=None,
+    max_duration_s=None,
+    enforce_max_duration=False,
+    expected_bitrate_mbps=250.0,
+    description="Capped-bitrate Mono8-derived MP4. Frame timing can be exact while pixel values remain lossy.",
+    recommended_use="Legacy long-run preset; prefer the camera-specific CV-optimal default config.",
+    writer_defaults=_cbr_writer_defaults(250.0, gop_frames=1200),
 )
 
 
 NEAR_LOSSLESS_H264_400M = RecordingProfileDefinition(
     id="near_lossless_h264_400m",
-    display_name="Near-lossless H.264 NVENC 400 Mbps",
+    display_name="Near-lossless H.264 NVENC 400 Mbps MP4",
     version=PROFILE_VERSION,
     compression="near_lossless_h264_nvenc",
     pixel_fidelity="near_lossless_lossy",
-    validation_status="validated_10min_on_current_system",
-    tested_duration_s=600.0,
-    max_duration_s=1800.0,
+    validation_status=REQUIRES_HARDWARE_VALIDATION,
+    tested_duration_s=None,
+    max_duration_s=None,
     enforce_max_duration=False,
     expected_bitrate_mbps=400.0,
-    description=(
-        "High-quality capped-bitrate NVENC profile for sustained 10-30 minute full-frame recordings. "
-        "Validated at 10 minutes on the current system. This replaces the old CQP8 stress profile, "
-        "which produced uncontrolled 1+ Gbps bursts and failed real-time timing."
-    ),
-    recommended_use=(
-        "Highest-quality practical experiment profile to validate after the proven 250 Mbps long-lossy mode. "
-        "Use when visual detail matters more than file size, but exact pixel values are not required."
-    ),
+    description="High-quality capped-bitrate MP4 that avoids uncontrolled lossless bursts but is not pixel exact.",
+    recommended_use="High-detail computer-vision work that tolerates small compression error.",
+    writer_defaults=_cbr_writer_defaults(400.0, gop_frames=1200),
+)
+
+
+# Retained for old configs. New CXP work should use the direct-MP4 camera-specific profile below.
+LOSSLESS_H264_NVENC_GPU = RecordingProfileDefinition(
+    id="lossless_h264_nvenc_gpu",
+    display_name="Legacy lossless H.264 NVENC gray calibration",
+    version=PROFILE_VERSION,
+    compression="lossless_h264_nvenc",
+    pixel_fidelity="lossless",
+    validation_status=REQUIRES_HARDWARE_VALIDATION,
+    tested_duration_s=None,
+    max_duration_s=30.0,
+    enforce_max_duration=False,
+    expected_bitrate_mbps=3600.0,
+    description="Legacy RAM-spooled AVI lossless calibration profile.",
+    recommended_use="Compatibility only; revalidate and verify real-session source hashes.",
     writer_defaults={
-        "mode": "compressed_nvenc",
-        "segment_seconds": 120,
-        "input_pix_fmt": "gray",
-        "codec": "h264_nvenc",
+        **_lossless_writer_defaults(3600.0, segment_seconds=30, gop_frames=1200),
+        "mode": "lossless_nvenc_spooled",
         "container": "avi",
-        "output_pix_fmt": "yuv420p",
-        "queue_max_frames": 1024,
-        "overwrite": False,
-        "hash_segments": False,
-        "expected_bitrate_mbps": 400,
-        "min_free_space_gb": 100,
-        "output_args": (
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p1",
-            "-tune",
-            "ull",
-            "-rc",
-            "cbr",
-            "-b:v",
-            "400M",
-            "-maxrate",
-            "400M",
-            "-bufsize",
-            "200M",
-            "-bf",
-            "0",
-            "-g",
-            "1200",
-            "-surfaces",
-            "64",
-            "-zerolatency",
-            "1",
-            "-gpu",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-            "-color_range",
-            "pc",
-        ),
+        "spool_output": True,
+        "spool_chunk_bytes": 8 * 1024 * 1024,
+        "spool_max_bytes": 32 * 1024**3,
+        "finalize_timeout_s": 1800,
     },
 )
 
 
-LOSSLESS_H264_NVENC_GPU = RecordingProfileDefinition(
-    id="lossless_h264_nvenc_gpu",
-    display_name="GPU lossless H.264 NVENC gray calibration",
+USB_MONO8_LOSSLESS_H264_NVENC_MP4 = RecordingProfileDefinition(
+    id="usb_mono8_lossless_h264_nvenc_mp4",
+    display_name="USB Mono8 lossless H.264 NVENC MP4",
+    version=PROFILE_VERSION,
+    compression="lossless_h264_nvenc_mp4",
+    pixel_fidelity="lossless",
+    validation_status=REQUIRES_HARDWARE_VALIDATION,
+    tested_duration_s=None,
+    max_duration_s=None,
+    enforce_max_duration=False,
+    expected_bitrate_mbps=900.0,
+    description="Lossless MP4 sized for the acA1300 USB Mono8 path.",
+    recommended_use="USB Mono8 runs requiring exact pixels after real-session hash verification.",
+    writer_defaults=_lossless_writer_defaults(900.0, segment_seconds=120, gop_frames=480),
+)
+
+
+CXP_MONO8_LOSSLESS_H264_NVENC_MP4 = RecordingProfileDefinition(
+    id="cxp_mono8_lossless_h264_nvenc_mp4",
+    display_name="CXP Mono8 lossless H.264 NVENC MP4",
+    version=PROFILE_VERSION,
+    compression="lossless_h264_nvenc_mp4",
+    pixel_fidelity="lossless",
+    validation_status=REQUIRES_HARDWARE_VALIDATION,
+    tested_duration_s=None,
+    max_duration_s=None,
+    enforce_max_duration=False,
+    expected_bitrate_mbps=4000.0,
+    description=(
+        "Lossless MP4 sized for a2A2448 CXP evidence of roughly 3.7-4.0 Gbps. "
+        "The current 60-second evidence lacks queue margin, so this profile is not locked."
+    ),
+    recommended_use="Engineering validation only until rollover, queue margin, and intended preview mode pass.",
+    writer_defaults=_lossless_writer_defaults(4000.0, segment_seconds=30, gop_frames=1200),
+)
+
+
+USB_BAYER8_LOSSLESS_H264_NVENC_GPU = RecordingProfileDefinition(
+    id="usb_bayer8_lossless_h264_nvenc_gpu",
+    display_name="USB Bayer8 lossless H.264 NVENC MP4",
     version=PROFILE_VERSION,
     compression="lossless_h264_nvenc",
-    pixel_fidelity="lossless",
-    validation_status="validated_30s_on_current_system",
-    tested_duration_s=30.0,
-    max_duration_s=30.0,
+    pixel_fidelity="lossless_bayer_luma",
+    validation_status=REQUIRES_HARDWARE_VALIDATION,
+    tested_duration_s=None,
+    max_duration_s=None,
     enforce_max_duration=False,
-    expected_bitrate_mbps=3600.0,
+    expected_bitrate_mbps=1200.0,
+    description="Stores the one-byte raw Bayer mosaic through the lossless luma path.",
+    recommended_use="Raw-color calibration after exact real-session Bayer-byte verification.",
+    writer_defaults=_lossless_writer_defaults(1200.0, segment_seconds=120, gop_frames=480),
+)
+
+
+ANALYSIS_H264_MP4_100M = RecordingProfileDefinition(
+    id="analysis_h264_mp4_100m",
+    display_name="CV-optimal H.264 NVENC 100 Mbps MP4",
+    version=PROFILE_VERSION,
+    compression="analysis_h264_nvenc_mp4",
+    pixel_fidelity="lossy_analysis",
+    validation_status=REQUIRES_HARDWARE_VALIDATION,
+    tested_duration_s=None,
+    max_duration_s=None,
+    enforce_max_duration=False,
+    expected_bitrate_mbps=100.0,
+    description="Small direct MP4 for the full-frame acA1300 Mono8 data rate.",
+    recommended_use="Default USB computer-vision recording when exact intensities are not required.",
+    writer_defaults=_cbr_writer_defaults(100.0, gop_frames=480),
+)
+
+
+ANALYSIS_H264_MP4_250M = RecordingProfileDefinition(
+    id="analysis_h264_mp4_250m",
+    display_name="CV-optimal H.264 NVENC 250 Mbps MP4",
+    version=PROFILE_VERSION,
+    compression="analysis_h264_nvenc_mp4",
+    pixel_fidelity="lossy_analysis",
+    validation_status=REQUIRES_HARDWARE_VALIDATION,
+    tested_duration_s=None,
+    max_duration_s=None,
+    enforce_max_duration=False,
+    expected_bitrate_mbps=250.0,
+    description="Small direct MP4 for full-frame 200 fps CXP Mono8 acquisition.",
+    recommended_use="Default CXP computer-vision recording with preview off until preview-on evidence passes.",
+    writer_defaults=_cbr_writer_defaults(250.0, gop_frames=1200),
+)
+
+
+ANALYSIS_H264_MP4_27M = RecordingProfileDefinition(
+    id="analysis_h264_mp4_27m",
+    display_name="Compact CXP H.264 NVENC 27 Mbps MP4",
+    version=PROFILE_VERSION,
+    compression="analysis_h264_nvenc_mp4",
+    pixel_fidelity="high_compression_lossy_analysis",
+    validation_status=REQUIRES_HARDWARE_VALIDATION,
+    tested_duration_s=None,
+    max_duration_s=None,
+    enforce_max_duration=False,
+    expected_bitrate_mbps=27.0,
     description=(
-        "GPU-backed NVENC lossless H.264 profile using the yuv420p luma path for Mono8 data. "
-        "Encoded AVI bytes are drained through a bounded RAM spool so slow disk writes do not immediately stall capture. "
-        "Synthetic full-size gray frames round-trip exactly. Camera validation passed at 30 seconds; 60 seconds failed real-time timing."
+        "Full-frame 2464x2064 at 200 fps with a 27 Mbps CBR target, approximately "
+        "202.5 MB per 60 seconds before small container overhead."
     ),
-    recommended_use="Short lossless calibration tests up to 30 seconds where exact decoded grayscale pixels must be verified after recording.",
+    recommended_use=(
+        "Storage-constrained computer-vision experiments after task-specific quality and "
+        "real-time hardware validation; compression is intentionally aggressive."
+    ),
+    writer_defaults=_cbr_writer_defaults(27.0, gop_frames=1200),
+)
+
+
+ANALYSIS_H264_MP4_RGB_200M = RecordingProfileDefinition(
+    id="analysis_h264_mp4_rgb_200m",
+    display_name="RGB source H.264 NVENC 200 Mbps MP4",
+    version=PROFILE_VERSION,
+    compression="analysis_h264_nvenc_mp4",
+    pixel_fidelity="lossy_color_analysis",
+    validation_status=REQUIRES_HARDWARE_VALIDATION,
+    tested_duration_s=None,
+    max_duration_s=None,
+    enforce_max_duration=False,
+    expected_bitrate_mbps=200.0,
+    description="Direct RGB8/BGR8 to yuv420p MP4; color conversion is intentionally lossy.",
+    recommended_use="Engineering color convenience only; raw Bayer is safer when exact source bytes matter.",
     writer_defaults={
-        "mode": "lossless_nvenc_spooled",
-        "segment_seconds": 120,
-        "input_pix_fmt": "gray",
-        "codec": "h264_nvenc",
-        "container": "avi",
-        "output_pix_fmt": "yuv420p",
-        "queue_max_frames": 1024,
-        "overwrite": False,
-        "hash_segments": False,
-        "expected_bitrate_mbps": 3600,
-        "min_free_space_gb": 80,
-        "spool_output": True,
-        "spool_chunk_bytes": 8388608,
-        "spool_max_bytes": 34359738368,
-        "output_args": (
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p1",
-            "-tune",
-            "lossless",
-            "-profile:v",
-            "high",
-            "-rc",
-            "constqp",
-            "-qp",
-            "0",
-            "-bf",
-            "0",
-            "-g",
-            "1200",
-            "-surfaces",
-            "64",
-            "-zerolatency",
-            "1",
-            "-gpu",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-            "-color_range",
-            "pc",
-        ),
+        **_cbr_writer_defaults(200.0, gop_frames=480),
+        "input_pix_fmt": "rgb24",
     },
 )
 
@@ -221,6 +305,13 @@ PROFILE_LIBRARY: dict[str, RecordingProfileDefinition] = {
         LONG_LOSSY_H264_250M,
         NEAR_LOSSLESS_H264_400M,
         LOSSLESS_H264_NVENC_GPU,
+        USB_BAYER8_LOSSLESS_H264_NVENC_GPU,
+        USB_MONO8_LOSSLESS_H264_NVENC_MP4,
+        CXP_MONO8_LOSSLESS_H264_NVENC_MP4,
+        ANALYSIS_H264_MP4_100M,
+        ANALYSIS_H264_MP4_250M,
+        ANALYSIS_H264_MP4_27M,
+        ANALYSIS_H264_MP4_RGB_200M,
     )
 }
 
@@ -245,3 +336,9 @@ def profile_config_dict(
     if enforce_max_duration is not None:
         data["enforce_max_duration"] = enforce_max_duration
     return data
+
+
+def profile_claims_losslessness(pixel_fidelity: str) -> bool:
+    """Return whether real-session source-vs-decode evidence is mandatory."""
+
+    return str(pixel_fidelity).strip().lower().startswith("lossless")

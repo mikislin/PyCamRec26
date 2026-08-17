@@ -1,12 +1,15 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycamrec"
-version = "0.1.0rc1"
-description = "Basler-focused video acquisition recorder"
+version = "0.2.0rc2"
+description = "Basler-focused scientific video acquisition recorder built from CamPy lessons."
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
   "numpy>=1.23",
   "PyYAML>=6.0",
@@ -15,9 +18,41 @@ dependencies = [
 [project.optional-dependencies]
 basler = ["pypylon==4.0.0"]
 preview = ["opencv-python>=4.8"]
+test = [
+  "pytest>=8",
+  "tomli>=2; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/mikislin/PyCamRec26"
+Repository = "https://github.com/mikislin/PyCamRec26"
+Issues = "https://github.com/mikislin/PyCamRec26/issues"
 
 [project.scripts]
 pycamrec = "pycamrec.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pycamrec*"]
+
+[tool.setuptools.data-files]
+"share/pycamrec" = [
+  "a2A2448-210cm_40559189.pfs",
+  "acA1300-200uc_24188001.pfs",
+  "acA1300-200uc_24188001_mono8.pfs",
+]
+"share/pycamrec/configs" = [
+  "configs/pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml",
+  "configs/pycamrec_basler_a2A2448_cxp_mono8_lossless.yaml",
+  "configs/pycamrec_basler_a2A2448_cxp_mono8_near_lossless.yaml",
+  "configs/pycamrec_basler_acA1300_usb_mono8_cv_optimal.yaml",
+  "configs/pycamrec_basler_acA1300_usb_mono8_lossless.yaml",
+  "configs/pycamrec_basler_acA1300_usb_mono8_near_lossless.yaml",
+]
+"share/pycamrec/schemas" = [
+  "schemas/experiment_metadata_v2.schema.json",
+  "schemas/task_quality_record_v1.schema.json",
+]
+"share/pycamrec/qualification" = ["qualification/task_quality_record.template.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

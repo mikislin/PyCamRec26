@@ -3,21 +3,10 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Any
 
+from .camera_backend import GrabbedFrame
 from .schemas import CameraConfig
-
-
-@dataclass(frozen=True)
-class GrabbedFrame:
-    frame_bytes: bytes
-    camera_block_id: int | None
-    camera_timestamp_raw: int | None
-    camera_timestamp_ns: int | None
-    host_receive_perf_counter_ns: int
-    host_receive_utc_ns: int
-    payload_size_bytes: int
 
 
 class BaslerCamera:
@@ -45,6 +34,7 @@ class BaslerCamera:
         self.camera = self.pylon.InstantCamera(self.factory.CreateDevice(device))
         self.camera.Open()
         self.pylon.FeaturePersistence.Load(str(self.cfg.pfs_path), self.camera.GetNodeMap(), False)
+        self._apply_runtime_overrides()
         self.camera.MaxNumBuffer = self.cfg.max_num_buffer
         if self.cfg.enable_chunks:
             self._enable_chunks()
@@ -70,6 +60,10 @@ class BaslerCamera:
             self.camera = None
 
     def read_temperature_c(self) -> float | None:
+        temperature_raw = self.read_temperature_raw()
+        return _normalize_temperature_c(temperature_raw)
+
+    def read_temperature_raw(self) -> float | None:
         if self.camera is None:
             return None
 
@@ -153,6 +147,8 @@ class BaslerCamera:
             "model": _call_or_none(device, "GetModelName") or _call_or_none(camera.GetDeviceInfo(), "GetModelName"),
             "vendor": _call_or_none(device, "GetVendorName"),
             "device_class": _call_or_none(device, "GetDeviceClass"),
+            "device_version": _call_or_none(device, "GetDeviceVersion"),
+            "tl_type": _call_or_none(device, "GetTLType"),
             "friendly_name": _call_or_none(device, "GetFriendlyName"),
             "interface_id": _property_value(device, "InterfaceID"),
             "device_id": _property_value(device, "DeviceID"),
@@ -166,6 +162,8 @@ class BaslerCamera:
             "gain": _node_value(camera, "Gain"),
             "chunk_mode_active": _node_value(camera, "ChunkModeActive"),
             "timestamp_tick_frequency_hz": self.timestamp_tick_frequency_hz,
+            "temperature_state": _node_value(camera, "TemperatureState"),
+            "device_temperature_raw": self.read_temperature_raw(),
             "device_temperature_c": self.read_temperature_c(),
         }
         return {key: value for key, value in info.items() if value is not None}
@@ -191,6 +189,27 @@ class BaslerCamera:
                 failures.append(f"{name}: expected {expected!r}, actual {actual!r}")
         if failures and self.cfg.strict_validation:
             raise RuntimeError("Camera validation failed: " + "; ".join(failures))
+
+    def _apply_runtime_overrides(self) -> None:
+        node_map = self.camera.GetNodeMap()
+        if self.cfg.allow_runtime_pixel_format_override:
+            actual = _node_value(self.camera, "PixelFormat")
+            if str(actual) != str(self.cfg.expected_pixel_format):
+                if not _try_set_node(node_map, "PixelFormat", self.cfg.expected_pixel_format):
+                    raise RuntimeError(
+                        "Could not apply runtime PixelFormat override: "
+                        f"expected {self.cfg.expected_pixel_format!r}, actual {actual!r}."
+                    )
+        if self.cfg.allow_runtime_frame_rate_override:
+            _try_set_node(node_map, "AcquisitionFrameRateEnable", True)
+            if not (
+                _try_set_node(node_map, "AcquisitionFrameRate", self.cfg.expected_fps)
+                or _try_set_node(node_map, "AcquisitionFrameRateAbs", self.cfg.expected_fps)
+            ):
+                raise RuntimeError(
+                    "Could not apply runtime AcquisitionFrameRate override: "
+                    f"expected {self.cfg.expected_fps!r}."
+                )
 
     def _enable_chunks(self) -> None:
         node_map = self.camera.GetNodeMap()
@@ -248,6 +267,14 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _normalize_temperature_c(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if value > 100.0 and value / 10.0 <= 100.0:
+        return value / 10.0
+    return value
+
+
 def _first_float_node(camera: Any, node_names: tuple[str, ...]) -> float | None:
     for node_name in node_names:
         value = _safe_float(_node_value(camera, node_name))
@@ -278,6 +305,8 @@ def _property_value(obj: Any, key: str) -> Any:
             value = method(key)
         except Exception:
             continue
+        if isinstance(value, (tuple, list)) and len(value) >= 2 and isinstance(value[0], bool):
+            value = value[1] if value[0] else None
         if value not in (None, ""):
             return value
     return None

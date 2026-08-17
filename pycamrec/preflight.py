@@ -18,6 +18,8 @@ class PreflightReport:
     pfs_features: dict[str, str]
     raw_bytes_per_second: float
     raw_bytes_total: float
+    estimated_output_bytes: float | None
+    estimated_capacity_s_at_target_rate: float | None
     output_free_bytes: int
     ffmpeg_version: str
     warnings: tuple[str, ...]
@@ -33,14 +35,20 @@ def run_preflight(cfg: PyCamRecConfig) -> PreflightReport:
     raw_total = raw_bps * cfg.session.duration_s
     disk_usage = shutil.disk_usage(output_root)
     ffmpeg_version = probe_ffmpeg(cfg.writer.ffmpeg_path)
+    estimated_output_bytes = None
+    estimated_capacity_s = None
+    if cfg.writer.expected_bitrate_mbps is not None:
+        bytes_per_second = cfg.writer.expected_bitrate_mbps * 1_000_000 / 8
+        estimated_output_bytes = bytes_per_second * cfg.session.duration_s
+        estimated_capacity_s = disk_usage.free / bytes_per_second if bytes_per_second > 0 else None
 
     warnings: list[str] = []
-    missing_experiment_fields = cfg.experiment.missing_fields()
-    if missing_experiment_fields:
+    experiment_issues = cfg.experiment.readiness_issues()
+    if experiment_issues:
         warnings.append(
-            "Experiment metadata has UNSPECIFIED fields: "
-            + ", ".join(missing_experiment_fields)
-            + ". Fill the experiment section before scientific recording."
+            "Experiment metadata is incomplete or invalid: "
+            + "; ".join(experiment_issues)
+            + ". Resolve it before scientific recording."
         )
     min_free_bytes = cfg.writer.min_free_space_gb * 1024**3
     if disk_usage.free < min_free_bytes:
@@ -61,6 +69,22 @@ def run_preflight(cfg: PyCamRecConfig) -> PreflightReport:
         warnings.append("Queue memory limit exceeds 8 GiB; use a smaller queue unless RAM has been reserved.")
     if cfg.writer.hash_segments and cfg.writer.segment_seconds < cfg.session.duration_s:
         warnings.append("writer.hash_segments is enabled during segmented recording; hashing can stall acquisition.")
+    if cfg.metadata.source_frame_hash_every > 0:
+        limit = (
+            f"up to {cfg.metadata.source_frame_hash_max_frames} frame(s)"
+            if cfg.metadata.source_frame_hash_max_frames > 0
+            else "for all matching frames"
+        )
+        warnings.append(
+            "metadata.source_frame_hash_every is enabled: source frame MD5 hashes are computed in the "
+            f"writer/metadata path every {cfg.metadata.source_frame_hash_every} frame(s), {limit}. "
+            "Use this for validation runs, not routine high-throughput recording."
+        )
+        if cfg.writer.input_pix_fmt != "gray":
+            warnings.append(
+                "Source-frame hash verification currently compares against FFmpeg gray/luma decode; "
+                "use it for Mono8/Bayer8 byte-stream validation, not RGB color proof."
+            )
     if cfg.writer.spool_output:
         warnings.append(
             "writer.spool_output is enabled: encoded bytes are buffered in RAM before/during disk writes. "
@@ -68,12 +92,12 @@ def run_preflight(cfg: PyCamRecConfig) -> PreflightReport:
         )
     if cfg.preview.enabled and cfg.preview.sink in {"window", "file"} and importlib.util.find_spec("cv2") is None:
         warnings.append("Preview is enabled but OpenCV (cv2) is not installed; recording will continue without preview.")
-    if cfg.writer.expected_bitrate_mbps is not None:
-        estimated_bytes = cfg.writer.expected_bitrate_mbps * 1_000_000 / 8 * cfg.session.duration_s
-        if disk_usage.free < estimated_bytes * 1.20:
+    if estimated_output_bytes is not None:
+        if disk_usage.free < estimated_output_bytes * 1.20:
             warnings.append(
                 "Free disk space is below 120% of the expected profile output size "
-                f"({estimated_bytes / 1024**3:.1f} GiB estimated)."
+                f"({estimated_output_bytes / 1024**3:.1f} GiB estimated at "
+                f"{cfg.writer.expected_bitrate_mbps:g} Mbps)."
             )
     if (
         cfg.recording_profile.max_duration_s is not None
@@ -90,19 +114,30 @@ def run_preflight(cfg: PyCamRecConfig) -> PreflightReport:
         and cfg.session.duration_s > cfg.recording_profile.tested_duration_s
     ):
         warnings.append(
-            f"Recording profile {cfg.recording_profile.id!r} has been validated for "
+            f"Recording profile {cfg.recording_profile.id!r} has evidence for "
             f"{cfg.recording_profile.tested_duration_s:g} seconds on this system; "
             f"this config requests {cfg.session.duration_s:g} seconds."
         )
-    if cfg.recording_profile.pixel_fidelity == "lossless" and cfg.session.duration_s > 120:
-        warnings.append("Lossless profile runs longer than 2 minutes are not recommended on this hardware.")
     if (
-        cfg.recording_profile.id != "custom"
-        and not cfg.recording_profile.validation_status.startswith("validated_")
+        cfg.recording_profile.pixel_fidelity == "lossless"
+        and cfg.session.duration_s > 120
+        and (
+            cfg.recording_profile.tested_duration_s is None
+            or cfg.session.duration_s > cfg.recording_profile.tested_duration_s
+        )
     ):
+        warnings.append("Lossless profile runs longer than 2 minutes are not recommended on this hardware.")
+    approval = cfg.raw.get("approval") if isinstance(cfg.raw, dict) else {}
+    approval_status = str(approval.get("status") or "") if isinstance(approval, dict) else ""
+    if cfg.recording_profile.id != "custom" and not approval_status.startswith("locked"):
         warnings.append(
-            f"Recording profile {cfg.recording_profile.id!r} has status "
-            f"{cfg.recording_profile.validation_status!r}; validate with a short run before scientific use."
+            f"Recording profile {cfg.recording_profile.id!r} is not hardware-locked; "
+            "this run can produce validation evidence but is not pre-approved for experiments."
+        )
+    elif approval_status.startswith("locked"):
+        warnings.append(
+            "A profile lock is configured. PyCamRec will compare its camera/PFS/GPU/driver/host/software "
+            "fingerprint and intended preview mode after opening the camera, before acquisition starts."
         )
     warnings.extend(_pfs_warnings(cfg, pfs_features))
 
@@ -111,6 +146,8 @@ def run_preflight(cfg: PyCamRecConfig) -> PreflightReport:
         pfs_features=pfs_features,
         raw_bytes_per_second=raw_bps,
         raw_bytes_total=raw_total,
+        estimated_output_bytes=estimated_output_bytes,
+        estimated_capacity_s_at_target_rate=estimated_capacity_s,
         output_free_bytes=disk_usage.free,
         ffmpeg_version=ffmpeg_version,
         warnings=tuple(warnings),
@@ -173,6 +210,11 @@ def _pfs_warnings(cfg: PyCamRecConfig, features: dict[str, str]) -> list[str]:
     for key, expected in comparisons.items():
         actual = features.get(key)
         if actual is not None and str(actual) != expected:
+            if key == "PixelFormat" and cfg.camera.allow_runtime_pixel_format_override:
+                warnings.append(
+                    f"PFS PixelFormat={actual!r}; PyCamRec will attempt runtime override to {expected!r}."
+                )
+                continue
             warnings.append(f"PFS {key}={actual!r} does not match config expected {expected!r}.")
 
     actual_fps = features.get("AcquisitionFrameRate")
@@ -182,9 +224,16 @@ def _pfs_warnings(cfg: PyCamRecConfig, features: dict[str, str]) -> list[str]:
         except ValueError:
             fps_mismatch = True
         if fps_mismatch:
-            warnings.append(
-                f"PFS AcquisitionFrameRate={actual_fps!r} does not match config expected {cfg.camera.expected_fps!r}."
-            )
+            if cfg.camera.allow_runtime_frame_rate_override:
+                warnings.append(
+                    "PFS AcquisitionFrameRate="
+                    f"{actual_fps!r}; PyCamRec will attempt runtime override to "
+                    f"{cfg.camera.expected_fps!r}."
+                )
+            else:
+                warnings.append(
+                    f"PFS AcquisitionFrameRate={actual_fps!r} does not match config expected {cfg.camera.expected_fps!r}."
+                )
     if features.get("LUTEnable") == "1":
         warnings.append("PFS has LUTEnable=1. Confirm it is an identity LUT or disable it for quantitative imaging.")
     if features.get("ChunkModeActive") in {None, "0"} and cfg.camera.enable_chunks:

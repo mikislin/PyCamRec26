@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .basler_device import BaslerCamera
+from .camera_backend import create_camera_backend
 from .preview import PreviewWorker
 from .schemas import PyCamRecConfig
 
@@ -51,7 +51,7 @@ class PreviewSession:
         if not self.cfg.preview.enabled:
             raise ValueError("PreviewSession requires preview.enabled=true.")
 
-        with BaslerCamera(self.cfg.camera) as camera:
+        with create_camera_backend(self.cfg.camera) as camera:
             self.stats.last_camera_temperature_c = _safe_round_float(
                 camera.device_info.get("device_temperature_c"),
             )
@@ -60,6 +60,7 @@ class PreviewSession:
                 source_width=self.cfg.camera.expected_width,
                 source_height=self.cfg.camera.expected_height,
                 source_fps=self.cfg.camera.expected_fps,
+                source_pixel_format=self.cfg.camera.expected_pixel_format,
                 queue_max_frames=self.cfg.writer.queue_max_frames,
                 session_dir=self.cfg.session.output_root,
                 recording_profile_id=self.cfg.recording_profile.id,

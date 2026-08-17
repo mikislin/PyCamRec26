@@ -13,5 +13,5 @@ __all__ = [
     "load_config",
 ]
 
-__version__ = "0.1.0rc1"
+__version__ = "0.2.0rc2"
 __release_stage__ = "pre-release"
