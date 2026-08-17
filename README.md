@@ -6,19 +6,18 @@ Repository: [github.com/mikislin/PyCamRec26](https://github.com/mikislin/PyCamRe
 
 ## Current readiness
 
-Version `0.2.0rc2` is **engineering-ready, not yet approved for scientific experiments on the current CXP system**. Built-in profiles describe encoder intent and always say `requires_hardware_validation`; approval lives in a generated config tied to hardware/software evidence, resolved profile settings, preview mode, and validated maximum duration.
+Version `0.2.0rc2` is **engineering-ready, not yet approved for scientific experiments on the current CXP system**. A built-in profile is a candidate definition, not an approval. Approval lives in a separate locked config tied to hardware/software evidence, resolved profile settings, preview mode, and validated maximum duration. The GUI presents profile qualification, current recording setup, and metadata readiness as independent states.
 
-Latest supplied CXP evidence for Mono8 2464x2064 at 200 fps:
+Latest compact CXP engineering evidence for Mono8 2464x2064 at 200 fps, collected on clean commit `cfa427b` on 2026-08-14:
 
-- 30 s, preview off: 199.10 fps, queue 85/1024, exact sampled pixels matched.
-- 60 s, preview off: 196.14 fps, queue 586/1024, exact sampled pixels matched, but the queue exceeded the 25% lock margin.
-- Preview on: 150-156 fps and 41-78% queue use; real-time QC failed.
-- Lossless output: approximately 3.7-4.0 Gbps, or 28-30 GB/min.
-- Observed internal device temperature: approximately 57-59 C.
+- 12/12 acquisition and QC passes across 30- and 60-second runs, three repeats per duration, preview on and off.
+- Exact recorded, expected, and FFprobe frame counts; zero block-ID gaps and zero detected drops.
+- Minimum observed rate 199.713 fps (99.856% of requested); worst queue 125/1024 (12.21%).
+- Every run rolled over to two MP4 segments and finalized without residual `.part` files.
+- 27.009 Mbps weighted output; 60-second MP4 totals were 202.56-202.66 decimal MB.
+- Maximum internal camera temperature 61.312 C during the sweep.
 
-Those sessions did not exercise MP4 rollover, used the older software fingerprint, and had incomplete experiment metadata. They remain useful engineering evidence but cannot lock the revised profile.
-
-Current compact-profile engineering smoke on the attached CXP camera (2026-08-14): 10 seconds produced 2,000/2,000 frames, FFprobe reported 2,000 frames at 2464x2064 and 200 fps, observed host rate was 199.99 fps, queue peaked at 108/1024, and the MP4 was 33,764,988 bytes at 27.02 Mbps. At the same rate, 60 seconds is approximately 202.6 MB. This short, single-segment, metadata-incomplete run validates the size/rate target only; it does not approve the profile for experiments.
+Preview-on performance therefore passes the current engineering timing and queue gates. The evidence is not lockable because it used unspecified experiment metadata and the placeholder failing task-quality record. Any code/configuration change after `cfa427b`, including this GUI/naming revision, changes the software or resolved-profile fingerprint and requires a new qualification run before locking.
 
 ## Supported targets and default configs
 
@@ -117,9 +116,13 @@ set "PY=C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe"
 
 Fill every `experiment:` field before a scientific run. For an engineering-only test, append `--allow-unspecified-metadata`; that run can pass acquisition and QC, but it cannot be experiment-ready or lock a profile.
 
+In the GUI, **Selected profile** describes encoder intent. **Profile qualification** says whether a hardware-specific lock certificate exists and covers the selected preview mode/duration. **Current setup** separately reports metadata and preflight readiness. A candidate profile may have excellent past engineering results and still correctly show as unapproved until a passing summary has been converted into and loaded as a locked config.
+
 ## Metadata v2 and session naming
 
 The v2 experiment schema uses typed subject and acquisition fields. Weight is a numeric value in grams, postnatal day is a non-negative integer, P0 means the birth date, dates use `YYYY-MM-DD`, and timestamps include a timezone. If DOB and P-day are both present, they must agree on the UTC recording date. The old `animal_id`, `dob`, `test_assay_name`, `experimentator`, and `project_protocol` keys remain readable as v1 aliases but new sessions are written as v2.
+
+The GUI can load a config JSON, a previous `experiment_metadata.json`, or a `session.json`. It imports only user-entered experiment fields, never the old session's automatic hardware/session values. DOB and weight-measurement fields have calendar pickers; **Today** derives P0/PND from DOB, and **Now** records a timezone-aware UTC weight timestamp. **Run index** is read-only: at recording start PyCamRec finds sessions with otherwise identical metadata and assigns `max(previous run index) + 1`. A private hash-only state file also prevents reuse when a process starts but does not leave a completed session.
 
 ```yaml
 experiment:
@@ -151,14 +154,17 @@ experiment:
 
 Custom keys are normalized to typed records and must use lower-case snake_case. The canonical output is validated against `schemas/experiment_metadata_v2.schema.json`; the GUI accepts a convenient JSON object such as `{"arena_id":"A03","lighting_lux":120}`.
 
-New sessions use UTC, stable UUIDs, and shallow machine-readable labels:
+Naming schema v2 keeps UUID identity in JSON metadata while putting the subject, PND, task, and run in human-readable paths:
 
 ```text
-OUTPUT_ROOT\project-social-vision\subject-m012\2026-08-14\
-  20260814T143052231Z__task-open-field__run-001__sid-<uuid>\
+OUTPUT_ROOT\project-o\subject-4\task-8_2026-08-14\
+  20260814T212746807Z__subject-4__P2__task-8__run-002\
+    segments\
+      20260814T212746807Z__subject-4__P2__task-8__run-002__segment_000001.mp4
+      20260814T212746807Z__subject-4__P2__task-8__run-002__segment_000002.mp4
 ```
 
-Weight, P-day, genotype, experimental group, notes, and custom values deliberately stay out of paths. Build a portable analysis index in PowerShell or CMD:
+Weight, genotype, experimental group, notes, and custom values deliberately stay out of paths. `session_id` remains the globally unique primary key in `session.json`, `experiment_metadata.json`, and the portable session index. Existing naming-v1 recordings remain discoverable because readers find `session.json` recursively and use paths recorded in `segments.csv`.
 
 ```powershell
 & $PY -m pycamrec index D:\PyCamRecSessions --output D:\PyCamRecSessions\sessions.csv --include-qc
@@ -252,6 +258,52 @@ Create a separate approved config only after the summary recommends a lock:
 
 `configs/approved/`, `configs/generated/`, and `validation_sweeps/` are intentionally ignored because they contain hardware/session-specific evidence and local paths.
 
+### Validate a custom recording config and generate its report
+
+A custom GUI config currently inherits a registered `profile` ID so PyCamRec knows whether it claims losslessness and which scientific gate applies. Copy the closest camera/fidelity candidate, give the copied YAML a clear filename, and change only reviewed camera/writer/preview settings. Do not retain a `lossless` profile ID after introducing a lossy pixel conversion. Keep `approval.status: requires_hardware_validation` until qualification passes.
+
+PowerShell example:
+
+```powershell
+$PY = 'C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe'
+$CUSTOM = 'configs\my_a2A2448_cxp_profile.yaml'
+Copy-Item configs\pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml $CUSTOM
+# Edit $CUSTOM: writer/output_args, expected_bitrate_mbps, qualification policy, and complete experiment metadata.
+& $PY -m pycamrec preflight $CUSTOM --duration-s 30
+& $PY -m pycamrec qualification-plan $CUSTOM
+& $PY -m pycamrec validation-sweep $CUSTOM --durations 30,60 --preview both --repeats 3 --required-passing-repeats 3 --task-quality-record qualification\task_quality_record.json --require-complete-metadata
+& $PY -m pycamrec lock-profile $CUSTOM validation_sweeps\YYYYMMDD_HHMMSS\validation_summary.json --preview-mode on --output configs\approved\my_a2A2448_cxp_profile_preview_on.yaml
+```
+
+CMD example:
+
+```bat
+set "PY=C:\Users\CodexCore\miniconda3\envs\pycamrec\python.exe"
+set "CUSTOM=configs\my_a2A2448_cxp_profile.yaml"
+copy configs\pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml "%CUSTOM%"
+rem Edit %CUSTOM%: writer/output_args, expected_bitrate_mbps, qualification policy, and complete experiment metadata.
+"%PY%" -m pycamrec preflight "%CUSTOM%" --duration-s 30
+"%PY%" -m pycamrec qualification-plan "%CUSTOM%"
+"%PY%" -m pycamrec validation-sweep "%CUSTOM%" --durations 30,60 --preview both --repeats 3 --required-passing-repeats 3 --task-quality-record qualification\task_quality_record.json --require-complete-metadata
+"%PY%" -m pycamrec lock-profile "%CUSTOM%" validation_sweeps\YYYYMMDD_HHMMSS\validation_summary.json --preview-mode on --output configs\approved\my_a2A2448_cxp_profile_preview_on.yaml
+```
+
+For a lossless custom config, replace `--task-quality-record ...` with `--verify-session-pixels --pixel-max-decode-frames 1000 --source-frame-hash-every 10 --source-frame-hash-max-frames 100`. If both preview modes are intended, create two locked configs from the same passing summary, one with `--preview-mode on` and one with `--preview-mode off`. Select the resulting locked config in the GUI; selecting the original custom candidate does not carry approval forward.
+
+After any completed run, create a persistent, non-overwriting JSON report:
+
+```powershell
+$SESSION = 'D:\PyCamRecSessions\project-o\subject-4\task-8_2026-08-14\SESSION_FOLDER'
+& $PY -m pycamrec report $SESSION --output "$SESSION\scientific_report.json"
+```
+
+```bat
+set "SESSION=D:\PyCamRecSessions\project-o\subject-4\task-8_2026-08-14\SESSION_FOLDER"
+"%PY%" -m pycamrec report "%SESSION%" --output "%SESSION%\scientific_report.json"
+```
+
+The report command refuses to overwrite an existing report. Use a new filename when intentionally regenerating after a software change.
+
 ## Camera onboarding and color modes
 
 Detect the attached camera and generate a reviewable candidate. CXP Mono8 now selects the CXP lossless profile and 4000 Mbps estimate, never the USB profile.
@@ -280,7 +332,7 @@ The 2026-08-14 attached-camera GUI smoke rendered 83 setup-preview frames withou
 
 Each session contains:
 
-- finalized `segments/segment_*.mp4` files;
+- finalized `segments/<session-name>__segment_*.mp4` files;
 - `frames.csv`, including block IDs, camera/host timestamps, queue depth, gap estimates, and optional source hashes;
 - `segments.csv` and `events.jsonl`;
 - `session.json`, `experiment_metadata.json`, and `analysis_manifest.json`;
@@ -290,12 +342,12 @@ Each session contains:
 Inspect a completed session:
 
 ```powershell
-& $PY -m pycamrec report D:\PyCamRecSessions\SESSION_FOLDER
+& $PY -m pycamrec report D:\PyCamRecSessions\SESSION_FOLDER --output D:\PyCamRecSessions\SESSION_FOLDER\scientific_report.json
 & $PY -m pycamrec verify-session-pixels D:\PyCamRecSessions\SESSION_FOLDER --max-decode-frames 1000
 ```
 
 ```bat
-"%PY%" -m pycamrec report D:\PyCamRecSessions\SESSION_FOLDER
+"%PY%" -m pycamrec report D:\PyCamRecSessions\SESSION_FOLDER --output D:\PyCamRecSessions\SESSION_FOLDER\scientific_report.json
 "%PY%" -m pycamrec verify-session-pixels D:\PyCamRecSessions\SESSION_FOLDER --max-decode-frames 1000
 ```
 

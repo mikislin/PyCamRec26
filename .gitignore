@@ -13,6 +13,7 @@ D_PyCamRecSessions/
 validation_sweeps/
 configs/generated/
 configs/approved/
+qualification/task_quality_record.json
 configs_legacy/
 campy/
 campy_review_pycamrec_plan.md
