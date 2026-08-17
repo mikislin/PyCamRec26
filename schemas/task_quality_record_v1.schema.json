@@ -17,11 +17,40 @@
     "schema_version": {"const": 1},
     "profile_id": {"type": "string", "minLength": 1},
     "profile_version": {"type": "string", "minLength": 1},
-    "status": {"enum": ["pass", "fail"]},
-    "reference_dataset_sha256": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+    "status": {"enum": ["pending", "pass", "fail"]},
+    "reference_dataset_sha256": {"type": "string", "pattern": "^$|^[a-fA-F0-9]{64}$"},
+    "reference_dataset_name": {"type": "string"},
     "acceptance_criteria": {"type": "object", "minProperties": 1},
     "metrics": {"type": "object", "minProperties": 1},
-    "evaluated_utc": {"type": "string", "format": "date-time"},
+    "evaluated_utc": {
+      "oneOf": [
+        {"type": "string", "format": "date-time"},
+        {"type": "null"}
+      ]
+    },
+    "validation_evidence": {
+      "type": "object",
+      "properties": {
+        "summary_file": {"type": "string"},
+        "sweep_completed_utc": {"type": "string", "format": "date-time"},
+        "hardware_fingerprint_sha256_values": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"}
+        },
+        "case_count": {"type": "integer", "minimum": 0},
+        "acquisition_pass_count": {"type": "integer", "minimum": 0},
+        "qc_pass_count": {"type": "integer", "minimum": 0},
+        "evidence_ready_count": {"type": "integer", "minimum": 0},
+        "all_acquisition_cases_pass": {"type": "boolean"},
+        "all_qc_cases_pass": {"type": "boolean"},
+        "all_evidence_cases_ready": {"type": "boolean"},
+        "preview_modes_exercised": {
+          "type": "array",
+          "items": {"enum": ["on", "off"]}
+        }
+      },
+      "additionalProperties": false
+    },
     "notes": {"type": "string"}
   },
   "additionalProperties": false

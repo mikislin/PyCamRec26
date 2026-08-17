@@ -18,7 +18,7 @@ from unittest import mock
 import yaml
 
 from pycamrec.acquisition import Recorder, RecordingStats, _source_hash_frame_indices
-from pycamrec.approval import lock_profile_from_summary
+from pycamrec.approval import finalize_qualification_from_summary, lock_profile_from_summary
 from pycamrec.cli import main as cli_main
 from pycamrec.config import load_config
 from pycamrec.gui import (
@@ -44,7 +44,12 @@ from pycamrec.metadata import (
 from pycamrec.preflight import PreflightReport
 from pycamrec.preview import PreviewWorker
 from pycamrec.report import build_session_report
-from pycamrec.qualification import build_qualification_plan, load_task_quality_record
+from pycamrec.qualification import (
+    build_qualification_plan,
+    load_task_quality_record,
+    set_task_quality_measurements,
+    update_task_quality_record_from_sweep,
+)
 from pycamrec.schemas import (
     CameraConfig,
     ExperimentMetadataConfig,
@@ -535,6 +540,92 @@ class ValidationGateTests(unittest.TestCase):
             self.assertEqual(approved_preview["width"], 320)
             self.assertEqual(approved_preview["max_fps"], 8.0)
 
+    def test_finalize_qualification_creates_both_approved_configs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = ROOT / "configs" / "pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml"
+            cfg = load_config(source, duration_s=1)
+            results = []
+            for mode, enabled, sink in (("off", False, "window"), ("on", True, "shm")):
+                preview = asdict(cfg.preview)
+                preview.update({"enabled": enabled, "sink": sink, "width": 512, "max_fps": 10.0})
+                fingerprint = build_profile_fingerprint(
+                    camera_config=asdict(cfg.camera),
+                    writer_config=asdict(cfg.writer),
+                    recording_profile=asdict(cfg.recording_profile),
+                    preview_config=preview,
+                )["fingerprint_sha256"]
+                evidence_session = root / f"evidence-{mode}"
+                evidence_session.mkdir()
+                (evidence_session / "session.json").write_text(
+                    json.dumps({"resolved": {"preview": preview}}), encoding="utf-8"
+                )
+                for repeat_index in range(1, 4):
+                    results.append(
+                        replace(
+                            _passing_sweep_result(
+                                case_id=f"{mode}-{repeat_index}",
+                                duration_s=60.0,
+                                repeat=repeat_index,
+                                session_dir=str(evidence_session),
+                                preview_enabled=enabled,
+                                profile_fingerprint_sha256=fingerprint,
+                            ),
+                            profile_id=cfg.recording_profile.id,
+                            pixel_fidelity=cfg.recording_profile.pixel_fidelity,
+                            lossless_claim=False,
+                            pixel_verified=False,
+                            pixel_status="not_run",
+                        )
+                    )
+            summary = root / "validation_summary.json"
+            summary.write_text(
+                json.dumps(
+                    {
+                        "requirements": {
+                            "passing_repeats_at_max_duration_required": 3,
+                            "pixel_verification_required": False,
+                            "task_quality_record_required": True,
+                        },
+                        "results": [asdict(result) for result in results],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task_record = root / "task_quality_record.json"
+            update_task_quality_record_from_sweep(
+                task_record,
+                source_path=None,
+                profile_id=cfg.recording_profile.id,
+                profile_version=cfg.recording_profile.version,
+                validation_evidence={"case_count": 6},
+            )
+            with self.assertRaisesRegex(ValueError, "updated from the sweep"):
+                finalize_qualification_from_summary(
+                    source, summary, task_record, root / "approved"
+                )
+            pending_status = json.loads((root / "profile_status.json").read_text())
+            self.assertEqual(pending_status["state"], "task_quality_pending")
+            self.assertFalse((root / "approved").exists())
+            reference = root / "reference-manifest.json"
+            reference.write_text('{"dataset":"immutable-v1"}', encoding="utf-8")
+            set_task_quality_measurements(
+                task_record,
+                reference_dataset_path=reference,
+                metrics={
+                    "tracking_median_error_px": 0.8,
+                    "segmentation_iou": 0.96,
+                    "event_f1": 0.97,
+                },
+            )
+            report = finalize_qualification_from_summary(
+                source, summary, task_record, root / "approved"
+            )
+            self.assertEqual(report["profile_state"], "approved")
+            self.assertTrue(Path(report["approved_configs"]["off"]).is_file())
+            self.assertTrue(Path(report["approved_configs"]["on"]).is_file())
+            self.assertTrue(json.loads((root / "profile_status.json").read_text())["approved"])
+
 
 class PreviewTests(unittest.TestCase):
     def _worker(self, metrics: dict[str, object]) -> PreviewWorker:
@@ -627,7 +718,8 @@ class PackagingAndEstimateTests(unittest.TestCase):
         )
         self.assertTrue(plan["task_quality_record_required"])
         self.assertEqual(plan["preview_sink"], "shm")
-        self.assertIn("--task-quality-record", plan["powershell_command"])
+        self.assertNotIn("--task-quality-record", plan["powershell_command"])
+        self.assertIn("pending task_quality_record.json", " ".join(plan["notes"]))
 
         with tempfile.TemporaryDirectory() as tmp:
             record_path = Path(tmp) / "task-quality.json"
@@ -658,6 +750,72 @@ class PackagingAndEstimateTests(unittest.TestCase):
                 required=True,
             )
             self.assertFalse(rejected["pass"])
+
+    def test_task_quality_status_is_computed_from_numeric_metrics(self) -> None:
+        cfg = load_config(
+            ROOT / "configs" / "pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml",
+            duration_s=1,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record_path = root / "task_quality_record.json"
+            update_task_quality_record_from_sweep(
+                record_path,
+                source_path=None,
+                profile_id=cfg.recording_profile.id,
+                profile_version=cfg.recording_profile.version,
+                validation_evidence={"case_count": 12},
+            )
+            self.assertEqual(json.loads(record_path.read_text())["status"], "pending")
+            reference = root / "reference-manifest.json"
+            reference.write_text('{"dataset":"immutable-v1"}', encoding="utf-8")
+            failed = set_task_quality_measurements(
+                record_path,
+                reference_dataset_path=reference,
+                metrics={
+                    "tracking_median_error_px": 1.1,
+                    "segmentation_iou": 0.96,
+                    "event_f1": 0.97,
+                },
+            )
+            self.assertEqual(failed["status"], "fail")
+            self.assertFalse(
+                load_task_quality_record(
+                    record_path,
+                    profile_id=cfg.recording_profile.id,
+                    profile_version=cfg.recording_profile.version,
+                    required=True,
+                )["pass"]
+            )
+            passed = set_task_quality_measurements(
+                record_path,
+                reference_dataset_path=reference,
+                metrics={
+                    "tracking_median_error_px": 0.8,
+                    "segmentation_iou": 0.96,
+                    "event_f1": 0.97,
+                },
+            )
+            self.assertEqual(passed["status"], "pass")
+            self.assertTrue(
+                load_task_quality_record(
+                    record_path,
+                    profile_id=cfg.recording_profile.id,
+                    profile_version=cfg.recording_profile.version,
+                    required=True,
+                )["pass"]
+            )
+            update_task_quality_record_from_sweep(
+                record_path,
+                source_path=record_path,
+                profile_id=cfg.recording_profile.id,
+                profile_version=cfg.recording_profile.version + "-changed",
+                validation_evidence={"case_count": 12},
+            )
+            invalidated = json.loads(record_path.read_text())
+            self.assertEqual(invalidated["status"], "pending")
+            self.assertIsNone(invalidated["metrics"]["event_f1"])
+            self.assertEqual(invalidated["reference_dataset_sha256"], "")
 
     def test_preview_on_qualification_uses_the_gui_shared_memory_sink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

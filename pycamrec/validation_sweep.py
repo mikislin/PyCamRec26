@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +18,7 @@ from .config import load_config
 from .hardware import session_hardware_fingerprint
 from .report import build_session_report
 from .profiles import profile_claims_losslessness
-from .qualification import load_task_quality_record
+from .qualification import load_task_quality_record, update_task_quality_record_from_sweep
 from .verify import verify_session_pixels
 
 
@@ -155,7 +155,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--task-quality-record",
         type=Path,
-        help="JSON evidence that lossy compression passed predefined scientific task metrics.",
+        help=(
+            "Working JSON for predefined scientific task metrics. It is updated with sweep "
+            "evidence; when omitted for a lossy profile, a pending record is created in the sweep folder."
+        ),
     )
     parser.add_argument("--stop-on-fail", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -167,12 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(base_cfg.raw, dict) and isinstance(base_cfg.raw.get("qualification"), dict)
         else {}
     )
-    task_quality = load_task_quality_record(
-        args.task_quality_record,
-        profile_id=base_cfg.recording_profile.id,
-        profile_version=base_cfg.recording_profile.version,
-        required=bool(qualification_policy.get("require_task_quality_record", False)),
-    )
+    task_quality_required = bool(qualification_policy.get("require_task_quality_record", False))
     parsed_bitrates = _parse_float_list(args.bitrates)
     cases = _build_cases(
         durations=_parse_float_list(args.durations),
@@ -228,7 +226,47 @@ def main(argv: list[str] | None = None) -> int:
         if args.stop_on_fail and not result.qc_pass:
             break
 
-    _write_summary(
+    task_quality_path = sweep_dir / "task_quality_record.json"
+    if task_quality_required or args.task_quality_record is not None:
+        fingerprints = sorted(
+            {result.hardware_fingerprint_sha256 for result in results if result.hardware_fingerprint_sha256}
+        )
+        preview_modes = sorted(
+            {"on" if result.preview_enabled else "off" for result in results}
+        )
+        update_task_quality_record_from_sweep(
+            task_quality_path,
+            source_path=args.task_quality_record,
+            profile_id=base_cfg.recording_profile.id,
+            profile_version=base_cfg.recording_profile.version,
+            validation_evidence={
+                "summary_file": "validation_summary.json",
+                "sweep_completed_utc": datetime.now(timezone.utc).isoformat(),
+                "hardware_fingerprint_sha256_values": fingerprints,
+                "case_count": len(results),
+                "acquisition_pass_count": sum(result.acquisition_pass for result in results),
+                "qc_pass_count": sum(result.qc_pass for result in results),
+                "evidence_ready_count": sum(result.evidence_ready for result in results),
+                "all_acquisition_cases_pass": bool(results) and all(result.acquisition_pass for result in results),
+                "all_qc_cases_pass": bool(results) and all(result.qc_pass for result in results),
+                "all_evidence_cases_ready": bool(results) and all(result.evidence_ready for result in results),
+                "preview_modes_exercised": preview_modes,
+            },
+        )
+        task_quality = load_task_quality_record(
+            task_quality_path,
+            profile_id=base_cfg.recording_profile.id,
+            profile_version=base_cfg.recording_profile.version,
+            required=task_quality_required,
+        )
+    else:
+        task_quality = load_task_quality_record(
+            None,
+            profile_id=base_cfg.recording_profile.id,
+            profile_version=base_cfg.recording_profile.version,
+            required=False,
+        )
+    summary = _write_summary(
         sweep_dir,
         args.config,
         results,
@@ -239,6 +277,54 @@ def main(argv: list[str] | None = None) -> int:
         verify_pixels=args.verify_session_pixels,
         required_passing_repeats=args.required_passing_repeats,
         task_quality=task_quality,
+    )
+    status_path = sweep_dir / "profile_status.json"
+    mode_recommendations = summary["profile_lock_by_preview_mode"]
+    modes_exercised = [key for key, value in mode_recommendations.items() if value != "no_cases_run"]
+    all_modes_lockable = bool(modes_exercised) and all(
+        str(mode_recommendations[key]).startswith("lock_validated_for_this_evidence_fingerprint_")
+        for key in modes_exercised
+    )
+    task_status = str((task_quality.get("document") or {}).get("status") or "not_required")
+    if all_modes_lockable:
+        profile_state = "ready_to_finalize"
+    elif (
+        results
+        and task_quality_required
+        and task_status != "pass"
+        and all(result.evidence_ready for result in results)
+    ):
+        profile_state = "task_quality_pending" if task_status == "pending" else "task_quality_failed"
+    elif not results or any(not result.qc_pass for result in results):
+        profile_state = "sweep_failed"
+    else:
+        profile_state = "not_lockable"
+    status_document = {
+        "schema_version": 1,
+        "profile_id": base_cfg.recording_profile.id,
+        "profile_version": base_cfg.recording_profile.version,
+        "state": profile_state,
+        "approved": False,
+        "task_quality_status": task_status,
+        "validation_summary": str((sweep_dir / "validation_summary.json").resolve()),
+        "task_quality_record": str(task_quality_path.resolve()) if task_quality_path.is_file() else "",
+        "preview_mode_recommendations": mode_recommendations,
+        "approved_configs": {},
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    status_path.write_text(json.dumps(status_document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "event": "validation_complete",
+                "validation_summary_path": str((sweep_dir / "validation_summary.json").resolve()),
+                "task_quality_record_path": str(task_quality_path.resolve()) if task_quality_path.is_file() else "",
+                "profile_status_path": str(status_path.resolve()),
+                "profile_state": profile_state,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
     )
 
     return 0 if any(result.qc_pass for result in results) else 1
@@ -760,7 +846,7 @@ def _write_summary(
     verify_pixels: bool,
     required_passing_repeats: int,
     task_quality: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     fingerprints = sorted({result.hardware_fingerprint_sha256 for result in results if result.hardware_fingerprint_sha256})
     technical_passes = [result for result in results if result.technical_pass]
     acquisition_passes = [result for result in results if result.acquisition_pass]
@@ -833,6 +919,7 @@ def _write_summary(
         json.dumps(document, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    return document
 
 
 def _profile_lock_recommendation(

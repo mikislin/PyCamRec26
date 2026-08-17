@@ -13,6 +13,11 @@ import yaml
 
 from .config import load_config
 from .hardware import build_profile_fingerprint
+from .qualification import (
+    load_task_quality_record,
+    set_task_quality_measurements,
+    update_task_quality_record_from_sweep,
+)
 
 
 def lock_profile_from_summary(
@@ -169,9 +174,221 @@ def lock_profile_from_summary(
     }
 
 
+def finalize_qualification_from_summary(
+    config_path: Path,
+    summary_path: Path,
+    task_quality_record_path: Path | None,
+    approved_dir: Path,
+    *,
+    reference_dataset_path: Path | None = None,
+    task_metrics: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Reassess task quality, update profile status, and create both mode locks.
+
+    This does not rerun acquisition and never converts missing downstream task
+    metrics into a pass.
+    """
+    from .validation_sweep import SweepResult, _profile_lock_recommendation
+
+    config_path = config_path.expanduser().resolve()
+    summary_path = summary_path.expanduser().resolve()
+    approved_dir = approved_dir.expanduser().resolve()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not isinstance(summary, dict):
+        raise ValueError("Validation summary must contain a JSON object.")
+    config = load_config(config_path, duration_s=1.0)
+    requirements = summary.get("requirements")
+    requirements = requirements if isinstance(requirements, dict) else {}
+    task_required = bool(requirements.get("task_quality_record_required"))
+    raw_results = summary.get("results") or []
+    if not isinstance(raw_results, list) or not raw_results:
+        raise ValueError("Validation summary has no sweep results.")
+    result_fields = set(SweepResult.__dataclass_fields__)
+    results = [
+        SweepResult(**{name: raw[name] for name in result_fields})
+        for raw in raw_results
+        if isinstance(raw, dict) and result_fields.issubset(raw)
+    ]
+    if len(results) != len(raw_results):
+        raise ValueError("Validation summary contains incomplete or incompatible sweep results.")
+    profile_ids = {result.profile_id for result in results}
+    if profile_ids != {config.recording_profile.id}:
+        raise ValueError(
+            f"Sweep profile IDs {sorted(profile_ids)!r} do not match {config.recording_profile.id!r}."
+        )
+    if task_required:
+        task_quality_record_path = (
+            task_quality_record_path.expanduser().resolve()
+            if task_quality_record_path is not None
+            else summary_path.with_name("task_quality_record.json")
+        )
+        update_task_quality_record_from_sweep(
+            task_quality_record_path,
+            source_path=task_quality_record_path if task_quality_record_path.is_file() else None,
+            profile_id=config.recording_profile.id,
+            profile_version=config.recording_profile.version,
+            validation_evidence={
+                "summary_file": summary_path.name,
+                "sweep_completed_utc": datetime.now(timezone.utc).isoformat(),
+                "hardware_fingerprint_sha256_values": sorted(
+                    {
+                        result.hardware_fingerprint_sha256
+                        for result in results
+                        if result.hardware_fingerprint_sha256
+                    }
+                ),
+                "case_count": len(results),
+                "acquisition_pass_count": sum(result.acquisition_pass for result in results),
+                "qc_pass_count": sum(result.qc_pass for result in results),
+                "evidence_ready_count": sum(result.evidence_ready for result in results),
+                "all_acquisition_cases_pass": all(result.acquisition_pass for result in results),
+                "all_qc_cases_pass": all(result.qc_pass for result in results),
+                "all_evidence_cases_ready": all(result.evidence_ready for result in results),
+                "preview_modes_exercised": sorted(
+                    {"on" if result.preview_enabled else "off" for result in results}
+                ),
+            },
+        )
+        if reference_dataset_path is not None or task_metrics is not None:
+            if reference_dataset_path is None or task_metrics is None:
+                raise ValueError("Reference dataset and all task metrics must be supplied together.")
+            set_task_quality_measurements(
+                task_quality_record_path,
+                reference_dataset_path=reference_dataset_path,
+                metrics=task_metrics,
+            )
+    task_quality = load_task_quality_record(
+        task_quality_record_path,
+        profile_id=config.recording_profile.id,
+        profile_version=config.recording_profile.version,
+        required=task_required,
+    )
+    verify_pixels = bool(requirements.get("pixel_verification_required"))
+    required_repeats = int(requirements.get("passing_repeats_at_max_duration_required") or 3)
+    summary["task_quality_record"] = task_quality
+    summary["profile_lock_recommendation"] = _profile_lock_recommendation(
+        results,
+        verify_pixels,
+        True,
+        required_repeats,
+        task_required,
+        bool(task_quality.get("pass")),
+    )
+    mode_recommendations = {}
+    for mode, enabled in (("off", False), ("on", True)):
+        mode_recommendations[f"preview_{mode}"] = _profile_lock_recommendation(
+            [result for result in results if result.preview_enabled is enabled],
+            verify_pixels,
+            True,
+            required_repeats,
+            task_required,
+            bool(task_quality.get("pass")),
+        )
+    summary["profile_lock_by_preview_mode"] = mode_recommendations
+    original_summary_path = summary_path.with_name("validation_summary.acquisition.json")
+    if not original_summary_path.exists():
+        original_summary_path.write_text(
+            summary_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    _atomic_write_json(summary_path, summary)
+    status_path = summary_path.with_name("profile_status.json")
+    status_base = {
+        "schema_version": 1,
+        "profile_id": config.recording_profile.id,
+        "profile_version": config.recording_profile.version,
+        "approved": False,
+        "task_quality_status": str((task_quality.get("document") or {}).get("status") or "not_required"),
+        "validation_summary": str(summary_path),
+        "validation_summary_sha256": _sha256_file(summary_path),
+        "task_quality_record": str(task_quality_record_path) if task_quality_record_path else "",
+        "task_quality_record_sha256": str(task_quality.get("sha256") or ""),
+        "preview_mode_recommendations": mode_recommendations,
+        "approved_configs": {},
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    if task_required and not task_quality.get("pass"):
+        status_base["state"] = (
+            "task_quality_pending"
+            if status_base["task_quality_status"] == "pending"
+            else "task_quality_failed"
+        )
+        _atomic_write_json(status_path, status_base)
+        issues = "; ".join(str(issue) for issue in task_quality.get("issues") or [])
+        raise ValueError(
+            "Task-quality record was updated from the sweep but is not ready. Add the immutable "
+            f"reference artifact and real task metrics, then finalize again. {issues}"
+        )
+    for mode in ("off", "on"):
+        recommendation = mode_recommendations[f"preview_{mode}"]
+        if not str(recommendation).startswith("lock_validated_for_this_evidence_fingerprint_"):
+            status_base["state"] = "not_lockable"
+            _atomic_write_json(status_path, status_base)
+            raise ValueError(
+                f"Cannot create both approved configs: preview {mode} is not lockable ({recommendation})."
+            )
+
+    approved_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {
+        mode: approved_dir / f"{config_path.stem}_preview_{mode}_approved.yaml"
+        for mode in ("off", "on")
+    }
+    existing = [path for path in outputs.values() if path.exists()]
+    if existing:
+        raise FileExistsError(
+            "Refusing to overwrite approved config(s): " + ", ".join(str(path) for path in existing)
+        )
+    created: list[Path] = []
+    lock_reports: dict[str, Any] = {}
+    try:
+        for mode in ("off", "on"):
+            lock_reports[mode] = lock_profile_from_summary(
+                config_path,
+                summary_path,
+                outputs[mode],
+                preview_mode=mode,
+            )
+            created.append(outputs[mode])
+    except Exception:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
+
+    status_document = {
+        "schema_version": 1,
+        "profile_id": config.recording_profile.id,
+        "profile_version": config.recording_profile.version,
+        "state": "approved",
+        "approved": True,
+        "task_quality_status": "pass" if task_required else "not_required",
+        "validation_summary": str(summary_path),
+        "validation_summary_sha256": _sha256_file(summary_path),
+        "task_quality_record": str(task_quality_record_path.expanduser().resolve()) if task_quality_record_path else "",
+        "task_quality_record_sha256": str(task_quality.get("sha256") or ""),
+        "preview_mode_recommendations": mode_recommendations,
+        "approved_configs": {mode: str(path) for mode, path in outputs.items()},
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    _atomic_write_json(status_path, status_document)
+    return {
+        "profile_state": "approved",
+        "profile_status_path": str(status_path),
+        "validation_summary_path": str(summary_path),
+        "task_quality_record_path": str(task_quality_record_path) if task_quality_record_path else "",
+        "approved_configs": {mode: str(path) for mode, path in outputs.items()},
+        "locks": lock_reports,
+    }
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _atomic_write_json(path: Path, document: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)

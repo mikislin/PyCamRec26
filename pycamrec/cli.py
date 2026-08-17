@@ -12,7 +12,7 @@ from typing import Any
 
 from .analysis_export import export_session_for_analysis
 from .analysis_io import inspect_video_read
-from .approval import lock_profile_from_summary
+from .approval import finalize_qualification_from_summary, lock_profile_from_summary
 from .acquisition import Recorder
 from .config import load_config
 from .diagnostics import inspect_camera_capabilities, inspect_pylon
@@ -159,6 +159,32 @@ def main(argv: list[str] | None = None) -> int:
     lock_parser.add_argument("validation_summary", type=Path)
     lock_parser.add_argument("--preview-mode", choices=("off", "on"), required=True)
     lock_parser.add_argument("--output", type=Path, required=True)
+
+    finalize_parser = subparsers.add_parser(
+        "finalize-qualification",
+        help="Compute the task-quality gate, update profile status, and create preview-on/off approved YAMLs.",
+    )
+    finalize_parser.add_argument("config", type=Path, help="Candidate profile YAML used for the sweep.")
+    finalize_parser.add_argument("validation_summary", type=Path)
+    finalize_parser.add_argument(
+        "--task-quality-record",
+        type=Path,
+        help="Sweep-bound record; defaults to task_quality_record.json beside the summary.",
+    )
+    finalize_parser.add_argument(
+        "--approved-dir",
+        type=Path,
+        default=Path("configs/approved"),
+        help="Empty destination directory for the two approved YAMLs.",
+    )
+    finalize_parser.add_argument(
+        "--reference-dataset",
+        type=Path,
+        help="Immutable task-evaluation dataset, archive, or manifest to hash into the record.",
+    )
+    finalize_parser.add_argument("--tracking-median-error-px", type=float)
+    finalize_parser.add_argument("--segmentation-iou", type=float)
+    finalize_parser.add_argument("--event-f1", type=float)
 
     sweep_parser = subparsers.add_parser(
         "validation-sweep",
@@ -363,6 +389,44 @@ def main(argv: list[str] | None = None) -> int:
                 args.validation_summary,
                 args.output,
                 preview_mode=args.preview_mode,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"ERROR: {exc}")
+            return 2
+        print(json.dumps(_jsonable(result), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "finalize-qualification":
+        task_record = args.task_quality_record or args.validation_summary.parent / "task_quality_record.json"
+        measurement_values = (
+            args.reference_dataset,
+            args.tracking_median_error_px,
+            args.segmentation_iou,
+            args.event_f1,
+        )
+        if any(value is not None for value in measurement_values) and not all(
+            value is not None for value in measurement_values
+        ):
+            print(
+                "ERROR: Provide --reference-dataset and all three task metrics together, or omit all four."
+            )
+            return 2
+        try:
+            result = finalize_qualification_from_summary(
+                args.config,
+                args.validation_summary,
+                task_record,
+                args.approved_dir,
+                reference_dataset_path=args.reference_dataset,
+                task_metrics=(
+                    {
+                        "tracking_median_error_px": args.tracking_median_error_px,
+                        "segmentation_iou": args.segmentation_iou,
+                        "event_f1": args.event_f1,
+                    }
+                    if args.reference_dataset is not None
+                    else None
+                ),
             )
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"ERROR: {exc}")

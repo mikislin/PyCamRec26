@@ -20,11 +20,11 @@ from datetime import date, datetime, timezone
 from fractions import Fraction
 from multiprocessing import shared_memory
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
 
 from . import __release_stage__, __version__
-from .approval import lock_profile_from_summary
+from .approval import finalize_qualification_from_summary
 from .config import load_config
 from .hardware import build_profile_fingerprint
 from .metadata import (
@@ -39,6 +39,7 @@ from .pixel_formats import is_bayer_pixel_format as is_bayer_camera_pixel_format
 from .pixel_formats import is_mono_pixel_format, is_rgb_pixel_format
 from .preflight import parse_pfs_features, run_preflight
 from .profiles import profile_claims_losslessness
+from .qualification import load_task_quality_record
 from .report import build_session_report
 from .session_index import discover_session_dirs
 
@@ -307,6 +308,8 @@ class PyCamRecApp:
         self.setup_preview_stop_requested = False
         self.setup_preview_previous_preview_enabled: bool | None = None
         self.last_session_dir: Path | None = None
+        self.last_validation_summary_path: Path | None = None
+        self.last_validation_profile_state = ""
         self.current_runtime_config: Path | None = None
         self.stop_file_path: Path | None = None
         self.setup_preview_stop_file_path: Path | None = None
@@ -825,7 +828,7 @@ class PyCamRecApp:
         ttk.Button(buttons, text="Run qualification sweep", command=self.run_onboarding_sweep).grid(
             row=0, column=2, sticky=tk.W, padx=(8, 0)
         )
-        ttk.Button(buttons, text="Create locked config...", command=self.create_locked_config).grid(
+        ttk.Button(buttons, text="Finalize & create both approved YAMLs...", command=self.create_locked_config).grid(
             row=1, column=0, sticky=tk.W, pady=(6, 0)
         )
         ttk.Button(buttons, text="Verify last pixels", command=self.verify_last_session_pixels).grid(
@@ -1426,16 +1429,7 @@ class PyCamRecApp:
                         str(hash_max),
                     ]
                 )
-            qualification = cfg.raw.get("qualification") if isinstance(cfg.raw, dict) else {}
-            task_quality_required = bool(
-                isinstance(qualification, dict)
-                and qualification.get("require_task_quality_record", False)
-            )
             task_quality_path = self.task_quality_record_var.get().strip()
-            if task_quality_required and not task_quality_path:
-                raise ValueError(
-                    "This lossy profile requires a passing task-quality record before qualification."
-                )
             if task_quality_path:
                 command.extend(["--task-quality-record", task_quality_path])
             if self.allow_unspecified_var.get():
@@ -1462,57 +1456,129 @@ class PyCamRecApp:
             messagebox.showerror("Could not start validation", str(exc))
             return
         self.status_var.set("Validation sweep")
-        self.onboard_status_var.set("Validation sweep running. Cases are appended to the command output.")
+        self.last_validation_summary_path = None
+        self.last_validation_profile_state = ""
+        self.onboard_status_var.set(
+            "Validation sweep running. A sweep-bound task-quality record and profile status will be created automatically."
+        )
         self._append_output("\n=== Validation sweep started ===\n" + " ".join(command) + "\n")
         self.validation_reader_thread = threading.Thread(target=self._read_validation_output, daemon=True)
         self.validation_reader_thread.start()
 
     def create_locked_config(self) -> None:
-        summary_path = filedialog.askopenfilename(
-            initialdir=str(WORKSPACE_ROOT / "validation_sweeps"),
-            title="Select passing validation_summary.json",
-            filetypes=(("Validation summary", "validation_summary.json"), ("JSON files", "*.json")),
-        )
-        if not summary_path:
+        if self.last_validation_summary_path and self.last_validation_summary_path.is_file():
+            summary_path = str(self.last_validation_summary_path)
+        else:
+            summary_path = filedialog.askopenfilename(
+                initialdir=str(WORKSPACE_ROOT / "validation_sweeps"),
+                title="Select validation_summary.json",
+                filetypes=(("Validation summary", "validation_summary.json"), ("JSON files", "*.json")),
+            )
+            if not summary_path:
+                return
+        summary_path_obj = Path(summary_path).resolve()
+        task_record = summary_path_obj.with_name("task_quality_record.json")
+        try:
+            summary_document = json.loads(summary_path_obj.read_text(encoding="utf-8"))
+            task_required = bool(
+                ((summary_document.get("requirements") or {}).get("task_quality_record_required"))
+            )
+            task_document = (
+                json.loads(task_record.read_text(encoding="utf-8")) if task_record.is_file() else {}
+            )
+            selected_cfg = load_config(Path(self.config_var.get()), duration_s=1.0)
+            task_record_ready = load_task_quality_record(
+                task_record if task_record.is_file() else None,
+                profile_id=selected_cfg.recording_profile.id,
+                profile_version=selected_cfg.recording_profile.version,
+                required=task_required,
+            )["pass"]
+        except Exception as exc:
+            messagebox.showerror("Could not read qualification evidence", str(exc))
             return
-        preview_choice = messagebox.askyesnocancel(
-            "Lock preview mode",
-            "Create a lock for preview ON?\n\nYes = preview on\nNo = preview off\nCancel = stop",
-        )
-        if preview_choice is None:
-            return
-        preview_mode = "on" if preview_choice else "off"
+        reference_path_for_finalize: Path | None = None
+        measurements_for_finalize: dict[str, float] | None = None
+        if task_required and not task_record_ready:
+            if not messagebox.askyesno(
+                "Complete task-quality evidence",
+                "Acquisition passed, but the lossy profile still needs real downstream-analysis metrics.\n\n"
+                "Select the immutable evaluation dataset/archive/manifest, then enter the three measured metrics. "
+                "PyCamRec will hash the file and calculate pass/fail; it will not trust a manually entered status.\n\n"
+                "Continue?",
+            ):
+                self.task_quality_record_var.set(str(task_record))
+                return
+            reference_path = filedialog.askopenfilename(
+                title="Select immutable task-quality reference artifact",
+                filetypes=(("All files", "*.*"),),
+            )
+            if not reference_path:
+                return
+            criteria = task_document.get("acceptance_criteria") or {}
+            prompts = (
+                (
+                    "tracking_median_error_px",
+                    "Tracking median error (px)",
+                    f"Enter measured tracking median error in pixels (maximum {criteria.get('tracking_median_error_px_max', 1.0)}):",
+                ),
+                (
+                    "segmentation_iou",
+                    "Segmentation IoU",
+                    f"Enter measured segmentation IoU (minimum {criteria.get('segmentation_iou_min', 0.95)}):",
+                ),
+                (
+                    "event_f1",
+                    "Event F1",
+                    f"Enter measured event F1 (minimum {criteria.get('event_f1_min', 0.95)}):",
+                ),
+            )
+            measurements: dict[str, float] = {}
+            for name, title, prompt in prompts:
+                value = simpledialog.askfloat(title, prompt, parent=self.root)
+                if value is None:
+                    return
+                measurements[name] = value
+            reference_path_for_finalize = Path(reference_path)
+            measurements_for_finalize = measurements
+            self.task_quality_record_var.set(str(task_record))
         approved_dir = WORKSPACE_ROOT / "configs" / "approved"
         approved_dir.mkdir(parents=True, exist_ok=True)
-        source_stem = Path(self.config_var.get()).stem
-        output_path = filedialog.asksaveasfilename(
+        selected_approved_dir = filedialog.askdirectory(
             initialdir=str(approved_dir),
-            initialfile=f"{source_stem}_preview_{preview_mode}_approved.yaml",
-            defaultextension=".yaml",
-            filetypes=(("YAML files", "*.yaml"), ("All files", "*.*")),
-            title="Save hardware-specific locked config",
+            title="Select empty folder for both approved YAMLs",
         )
-        if not output_path:
+        if not selected_approved_dir:
             return
         try:
-            result = lock_profile_from_summary(
+            result = finalize_qualification_from_summary(
                 Path(self.config_var.get()),
-                Path(summary_path),
-                Path(output_path),
-                preview_mode=preview_mode,
+                summary_path_obj,
+                task_record if task_record.is_file() else None,
+                Path(selected_approved_dir),
+                reference_dataset_path=reference_path_for_finalize,
+                task_metrics=measurements_for_finalize,
             )
         except Exception as exc:
-            messagebox.showerror("Profile was not lockable", str(exc))
+            messagebox.showerror("Qualification could not be finalized", str(exc))
             return
-        self.config_var.set(str(Path(output_path).resolve()))
+        selected_mode = "on" if self.preview_enabled_var.get() else "off"
+        selected_config = Path(result["approved_configs"][selected_mode]).resolve()
+        self.config_var.set(str(selected_config))
         self.profile_choice_var.set(CUSTOM_PROFILE_LABEL)
         self.camera_profile_var.set("")
-        self.preview_enabled_var.set(preview_choice)
+        self.last_validation_profile_state = "approved"
         self.onboard_status_var.set(
-            f"Created and selected {preview_mode} locked config:\n{output_path}\n"
+            "Profile approved. Created preview-off and preview-on YAMLs and selected the one matching "
+            f"the current preview setting:\n{selected_config}\n"
             "Recording startup will still verify the live hardware/software fingerprint."
         )
-        self._append_output("\n=== Locked profile config ===\n" + json.dumps(result, indent=2) + "\n")
+        self._append_output("\n=== Qualification finalized ===\n" + json.dumps(result, indent=2) + "\n")
+        messagebox.showinfo(
+            "Profile approved",
+            "Both hardware-specific YAMLs were created:\n\n"
+            f"Preview off: {result['approved_configs']['off']}\n"
+            f"Preview on: {result['approved_configs']['on']}",
+        )
         self._load_profile_summary()
 
     def verify_last_session_pixels(self) -> None:
@@ -2483,6 +2549,18 @@ class PyCamRecApp:
             payload = json.loads(line)
         except json.JSONDecodeError:
             return
+        if payload.get("event") == "validation_complete":
+            summary_path = str(payload.get("validation_summary_path") or "")
+            task_record_path = str(payload.get("task_quality_record_path") or "")
+            self.last_validation_summary_path = Path(summary_path) if summary_path else None
+            self.last_validation_profile_state = str(payload.get("profile_state") or "")
+            if task_record_path:
+                self.task_quality_record_var.set(task_record_path)
+            self.onboard_status_var.set(
+                f"Sweep complete: profile state={self.last_validation_profile_state}. "
+                "Use 'Finalize & create both approved YAMLs'—the camera does not need to be rerun."
+            )
+            return
         case_id = payload.get("case_id", "case")
         status = str(payload.get("qc_status") or "unknown")
         fps = payload.get("observed_fps")
@@ -2503,11 +2581,20 @@ class PyCamRecApp:
         self.validation_process = None
         if return_code == 0:
             self.status_var.set("Validation completed")
-            self.onboard_status_var.set(
-                "Qualification process completed. Exit code 0 does not mean the profile is approved: "
-                "review validation_summary.json for metadata/task-quality gates and the preview-mode-specific "
-                "lock recommendation, then create and load a locked config."
-            )
+            if self.last_validation_profile_state == "task_quality_pending":
+                self.onboard_status_var.set(
+                    "Acquisition qualification passed. Task-quality metrics are pending. Click "
+                    "'Finalize & create both approved YAMLs'; no camera rerun is required."
+                )
+            elif self.last_validation_profile_state == "ready_to_finalize":
+                self.onboard_status_var.set(
+                    "All qualification gates pass. Click 'Finalize & create both approved YAMLs'."
+                )
+            else:
+                self.onboard_status_var.set(
+                    f"Qualification completed with profile state '{self.last_validation_profile_state or 'unknown'}'. "
+                    "Review validation_summary.json and profile_status.json."
+                )
         else:
             self.status_var.set(f"Validation exited with code {return_code}")
             self.onboard_status_var.set("Validation sweep did not produce a scientific pass. Review command output and validation_summary.json.")
