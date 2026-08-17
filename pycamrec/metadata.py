@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import shutil
 import socket
@@ -19,7 +20,312 @@ from . import __release_stage__, __version__
 from .hardware import build_hardware_fingerprint
 from .pixel_formats import channel_semantics
 from .preflight import PreflightReport, sha256_file
-from .schemas import PyCamRecConfig
+from .schemas import ExperimentMetadataConfig, PyCamRecConfig
+
+
+NAMING_SCHEMA_VERSION = 2
+RUN_INDEX_STATE_SCHEMA_VERSION = 1
+
+
+def normalize_custom_fields(value: Any) -> dict[str, dict[str, Any]]:
+    """Return typed custom fields while accepting user-friendly scalar JSON values."""
+
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("custom_fields must be a JSON object")
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_item in value.items():
+        name = str(raw_name).strip()
+        if isinstance(raw_item, dict) and ("value" in raw_item or "value_type" in raw_item):
+            item = dict(raw_item)
+            item.setdefault("value_type", _custom_value_type(item.get("value")))
+        else:
+            item = {"value": raw_item, "value_type": _custom_value_type(raw_item)}
+        if item.get("unit") is None:
+            item.pop("unit", None)
+        normalized[name] = item
+    return normalized
+
+
+def normalize_experiment_metadata_document(document: dict[str, Any]) -> dict[str, Any]:
+    """Normalize config, session, exported, or flat metadata JSON to schema-v2 input."""
+
+    if not isinstance(document, dict):
+        raise ValueError("Metadata JSON must contain an object at its top level")
+    embedded = document.get("experiment_metadata")
+    if isinstance(embedded, dict):
+        return normalize_experiment_metadata_document(embedded)
+    experiment = document.get("experiment")
+    if isinstance(experiment, dict):
+        source = experiment
+    else:
+        resolved = document.get("resolved")
+        resolved_experiment = resolved.get("experiment") if isinstance(resolved, dict) else None
+        source = resolved_experiment if isinstance(resolved_experiment, dict) else document
+
+    fixed = source.get("fixed_fields") if isinstance(source.get("fixed_fields"), dict) else {}
+    project = source.get("project") if isinstance(source.get("project"), dict) else {}
+    subject = source.get("subject") if isinstance(source.get("subject"), dict) else {}
+    acquisition = source.get("acquisition") if isinstance(source.get("acquisition"), dict) else {}
+
+    def pick(*candidates: tuple[dict[str, Any], str], default: Any = "") -> Any:
+        for mapping, key in candidates:
+            if key in mapping and mapping[key] is not None:
+                return mapping[key]
+        return default
+
+    custom = pick((source, "custom_fields"), (fixed, "custom_fields"), default={})
+    run_index = pick((acquisition, "run_index"), (source, "run_index"), (fixed, "run_index"), default=1)
+    try:
+        run_index = int(run_index)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Metadata run_index must be an integer") from exc
+
+    return {
+        "schema_version": 2,
+        "project": {
+            "project_id": str(pick((project, "project_id"), (source, "project_id"), (fixed, "project_id"))),
+            "protocol_id": str(
+                pick(
+                    (project, "protocol_id"),
+                    (source, "protocol_id"),
+                    (source, "project_protocol"),
+                    (fixed, "protocol_id"),
+                    (fixed, "project_protocol"),
+                )
+            ),
+            "assay_id": str(
+                pick(
+                    (project, "assay_id"),
+                    (source, "assay_id"),
+                    (source, "test_assay_name"),
+                    (fixed, "assay_id"),
+                    (fixed, "test_assay_name"),
+                )
+            ),
+        },
+        "subject": {
+            "subject_id": str(
+                pick(
+                    (subject, "subject_id"),
+                    (source, "subject_id"),
+                    (source, "animal_id"),
+                    (fixed, "subject_id"),
+                    (fixed, "animal_id"),
+                )
+            ),
+            "species": str(pick((subject, "species"), (source, "species"), (fixed, "species"))),
+            "date_of_birth": str(
+                pick(
+                    (subject, "date_of_birth"),
+                    (source, "date_of_birth"),
+                    (source, "dob"),
+                    (fixed, "date_of_birth"),
+                    (fixed, "dob"),
+                )
+                or ""
+            ),
+            "postnatal_day": pick(
+                (subject, "postnatal_day"),
+                (source, "postnatal_day"),
+                (fixed, "postnatal_day"),
+                default=None,
+            ),
+            "postnatal_day_source": str(
+                pick(
+                    (subject, "postnatal_day_source"),
+                    (source, "postnatal_day_source"),
+                    (fixed, "postnatal_day_source"),
+                    default="manual",
+                )
+            ),
+            "p0_convention": str(
+                pick(
+                    (subject, "p0_convention"),
+                    (source, "p0_convention"),
+                    (fixed, "p0_convention"),
+                    default="birth_date_is_p0",
+                )
+            ),
+            "weight_g": pick(
+                (subject, "weight_g"), (source, "weight_g"), (fixed, "weight_g"), default=None
+            ),
+            "weight_measured_utc": str(
+                pick(
+                    (subject, "weight_measured_utc"),
+                    (source, "weight_measured_utc"),
+                    (fixed, "weight_measured_utc"),
+                )
+                or ""
+            ),
+            "genotype": str(pick((subject, "genotype"), (source, "genotype"), (fixed, "genotype"))),
+            "experimental_group": str(
+                pick(
+                    (subject, "experimental_group"),
+                    (source, "experimental_group"),
+                    (fixed, "experimental_group"),
+                )
+            ),
+            "sex": str(pick((subject, "sex"), (source, "sex"), (fixed, "sex"))),
+        },
+        "acquisition": {
+            "experimenter_id": str(
+                pick(
+                    (acquisition, "experimenter_id"),
+                    (source, "experimenter_id"),
+                    (source, "experimentator"),
+                    (fixed, "experimenter_id"),
+                    (fixed, "experimentator"),
+                )
+            ),
+            "run_index": run_index,
+        },
+        "custom_fields": normalize_custom_fields(custom),
+        "notes": str(pick((source, "notes"), (fixed, "notes"))),
+    }
+
+
+def load_experiment_metadata_json(path: Path) -> dict[str, Any]:
+    value = json.loads(path.expanduser().resolve().read_text(encoding="utf-8-sig"))
+    if not isinstance(value, dict):
+        raise ValueError("Metadata JSON must contain an object at its top level")
+    return normalize_experiment_metadata_document(value)
+
+
+def experiment_metadata_config(document: dict[str, Any]) -> ExperimentMetadataConfig:
+    normalized = normalize_experiment_metadata_document(document)
+    project = normalized["project"]
+    subject = normalized["subject"]
+    acquisition = normalized["acquisition"]
+
+    def optional_int(value: Any) -> int | None:
+        if value in (None, "", "UNSPECIFIED"):
+            return None
+        if isinstance(value, bool):
+            raise ValueError("postnatal_day must be an integer")
+        converted = int(value)
+        if isinstance(value, float) and value != converted:
+            raise ValueError("postnatal_day must be an integer")
+        return converted
+
+    def optional_float(value: Any) -> float | None:
+        if value in (None, "", "UNSPECIFIED"):
+            return None
+        return float(value)
+
+    return ExperimentMetadataConfig(
+        schema_version=2,
+        project_id=str(project["project_id"]),
+        protocol_id=str(project["protocol_id"]),
+        assay_id=str(project["assay_id"]),
+        subject_id=str(subject["subject_id"]),
+        species=str(subject["species"]),
+        date_of_birth=str(subject["date_of_birth"] or ""),
+        postnatal_day=optional_int(subject["postnatal_day"]),
+        postnatal_day_source=str(subject["postnatal_day_source"]),
+        p0_convention=str(subject["p0_convention"]),
+        weight_g=optional_float(subject["weight_g"]),
+        weight_measured_utc=str(subject["weight_measured_utc"] or ""),
+        genotype=str(subject["genotype"]),
+        experimental_group=str(subject["experimental_group"]),
+        sex=str(subject["sex"]),
+        experimenter_id=str(acquisition["experimenter_id"]),
+        run_index=int(acquisition["run_index"]),
+        custom_fields=normalize_custom_fields(normalized["custom_fields"]),
+        notes=str(normalized["notes"]),
+    )
+
+
+def experiment_metadata_signature(document: dict[str, Any]) -> str:
+    normalized = normalize_experiment_metadata_document(document)
+    acquisition = dict(normalized["acquisition"])
+    acquisition.pop("run_index", None)
+    normalized["acquisition"] = acquisition
+    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def next_run_index(
+    output_root: Path,
+    document: dict[str, Any],
+    *,
+    state_path: Path | None = None,
+) -> int:
+    """Find the next run number for an otherwise identical metadata document."""
+
+    signature = experiment_metadata_signature(document)
+    highest = 0
+    root = output_root.expanduser().resolve()
+    if root.exists():
+        for metadata_path in root.rglob("experiment_metadata.json"):
+            try:
+                existing = load_experiment_metadata_json(metadata_path)
+                if experiment_metadata_signature(existing) != signature:
+                    continue
+                highest = max(highest, int(existing["acquisition"]["run_index"]))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+    state = _read_run_index_state(state_path)
+    entry = state.get("entries", {}).get(signature, {})
+    try:
+        highest = max(highest, int(entry.get("last_started_run_index") or 0))
+    except (TypeError, ValueError):
+        pass
+    return highest + 1
+
+
+def record_run_start(
+    state_path: Path,
+    document: dict[str, Any],
+    run_index: int,
+) -> None:
+    """Persist a started run number without storing experiment identifiers or notes."""
+
+    if run_index <= 0:
+        raise ValueError("run_index must be positive")
+    signature = experiment_metadata_signature(document)
+    state = _read_run_index_state(state_path)
+    entries = state.setdefault("entries", {})
+    existing = entries.get(signature, {})
+    try:
+        previous = int(existing.get("last_started_run_index") or 0)
+    except (TypeError, ValueError):
+        previous = 0
+    entries[signature] = {
+        "last_started_run_index": max(previous, int(run_index)),
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(state_path)
+
+
+def _read_run_index_state(state_path: Path | None) -> dict[str, Any]:
+    default = {"schema_version": RUN_INDEX_STATE_SCHEMA_VERSION, "entries": {}}
+    if state_path is None or not state_path.is_file():
+        return default
+    try:
+        value = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+    if not isinstance(value, dict) or not isinstance(value.get("entries"), dict):
+        return default
+    return {
+        "schema_version": RUN_INDEX_STATE_SCHEMA_VERSION,
+        "entries": dict(value["entries"]),
+    }
+
+
+def _custom_value_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return "string"
 
 
 @dataclass(frozen=True)
@@ -154,15 +460,17 @@ class MetadataWriter:
         assay_slug = _path_slug(self.cfg.experiment.assay_id)
         date_slug = self.created_at.strftime("%Y-%m-%d")
         timestamp = self.created_at.strftime("%Y%m%dT%H%M%S") + f"{self.created_at.microsecond // 1000:03d}Z"
+        postnatal_day = self.cfg.experiment.postnatal_day
+        postnatal_slug = f"P{postnatal_day}" if postnatal_day is not None else "P-unspecified"
         session_name = (
-            f"{timestamp}__task-{assay_slug}__run-{self.cfg.experiment.run_index:03d}"
-            f"__sid-{self.session_id}"
+            f"{timestamp}__subject-{subject_slug}__{postnatal_slug}__task-{assay_slug}"
+            f"__run-{self.cfg.experiment.run_index:03d}"
         )
         session_dir = (
             root
             / f"project-{project_slug}"
             / f"subject-{subject_slug}"
-            / date_slug
+            / f"task-{assay_slug}_{date_slug}"
             / session_name
         )
         session_dir.mkdir(parents=True, exist_ok=False)
@@ -175,7 +483,7 @@ class MetadataWriter:
         hardware_fingerprint = self._hardware_fingerprint()
         session_doc = {
             "schema_version": 2,
-            "naming_schema_version": 1,
+            "naming_schema_version": NAMING_SCHEMA_VERSION,
             "session_id": self.session_id,
             "created_utc": self.created_at.isoformat(),
             "host": socket.gethostname(),
@@ -220,7 +528,7 @@ class MetadataWriter:
         document = {
             "schema_version": 2,
             "session_id": self.session_id,
-            "naming_schema_version": 1,
+            "naming_schema_version": NAMING_SCHEMA_VERSION,
             "session_directory_name": self.session_dir.name,
             "relative_segments_directory": "segments",
             "camera": {
@@ -269,7 +577,7 @@ class MetadataWriter:
         automatic: dict[str, Any] = {
             "created_utc": self.created_at.isoformat(),
             "session_id": self.session_id,
-            "naming_schema_version": 1,
+            "naming_schema_version": NAMING_SCHEMA_VERSION,
             "session_directory": str(self.session_dir),
             "session_directory_name": self.session_dir.name,
             "computer_name": socket.gethostname(),

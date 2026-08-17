@@ -296,10 +296,16 @@ class FfmpegSegmentWriter:
             self._spool_current_queued_bytes = max(0, self._spool_current_queued_bytes - byte_count)
 
     def _temp_path(self, segment_id: int) -> Path:
-        return self.segments_dir / f"segment_{segment_id:06d}.part.{self.cfg.writer.container}"
+        display_segment = segment_id + 1
+        return self.segments_dir / (
+            f"{self.segments_dir.parent.name}__segment_{display_segment:06d}.part.{self.cfg.writer.container}"
+        )
 
     def _final_path(self, segment_id: int) -> Path:
-        return self.segments_dir / f"segment_{segment_id:06d}.{self.cfg.writer.container}"
+        display_segment = segment_id + 1
+        return self.segments_dir / (
+            f"{self.segments_dir.parent.name}__segment_{display_segment:06d}.{self.cfg.writer.container}"
+        )
 
 
 def _format_fps(fps: float) -> str:

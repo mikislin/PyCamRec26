@@ -43,6 +43,11 @@ def main(argv: list[str] | None = None) -> int:
 
     report_parser = subparsers.add_parser("report", help="Summarize a completed PyCamRec session.")
     report_parser.add_argument("session_dir", type=Path)
+    report_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Also write the JSON report to this path (refuses to overwrite an existing file).",
+    )
 
     index_parser = subparsers.add_parser(
         "index",
@@ -222,7 +227,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "report":
         report = build_session_report(args.session_dir)
-        print(json.dumps(_jsonable(report), indent=2, sort_keys=True))
+        rendered = json.dumps(_jsonable(report), indent=2, sort_keys=True)
+        if args.output is not None:
+            output_path = args.output.expanduser().resolve()
+            if output_path.exists():
+                print(f"ERROR: Refusing to overwrite existing report: {output_path}")
+                return 2
+            try:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(rendered + "\n", encoding="utf-8")
+            except OSError as exc:
+                print(f"ERROR: Could not write report to {output_path}: {exc}")
+                return 2
+        print(rendered)
         return 0
 
     if args.command == "index":

@@ -19,15 +19,27 @@ import yaml
 
 from pycamrec.acquisition import _source_hash_frame_indices
 from pycamrec.approval import lock_profile_from_summary
+from pycamrec.cli import main as cli_main
 from pycamrec.config import load_config
-from pycamrec.gui import _disk_estimate_text, _integrated_preview_sink
+from pycamrec.gui import (
+    _disk_estimate_text,
+    _integrated_preview_sink,
+    _preview_warning_text,
+    _profile_qualification_text,
+)
 from pycamrec.hardware import (
     build_hardware_fingerprint,
     build_profile_fingerprint,
     evaluate_profile_approval,
 )
 from pycamrec.onboarding import generate_camera_config
-from pycamrec.metadata import MetadataWriter
+from pycamrec.metadata import (
+    MetadataWriter,
+    experiment_metadata_config,
+    load_experiment_metadata_json,
+    next_run_index,
+    record_run_start,
+)
 from pycamrec.preflight import PreflightReport
 from pycamrec.preview import PreviewWorker
 from pycamrec.report import build_session_report
@@ -238,6 +250,25 @@ class ReportTests(unittest.TestCase):
                 report = build_session_report(root)
             self.assertFalse(report["qc"]["acquisition_pass"])
             self.assertEqual(report["qc"]["status"], "fail_frame_integrity")
+
+    def test_cli_report_can_write_without_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "scientific_report.json"
+            with mock.patch("pycamrec.cli.build_session_report", return_value={"qc": {"status": "pass"}}):
+                self.assertEqual(cli_main(["report", str(root), "--output", str(output)]), 0)
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["qc"]["status"], "pass")
+                self.assertEqual(cli_main(["report", str(root), "--output", str(output)]), 2)
+
+    def test_cli_report_handles_output_write_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "scientific_report.json"
+            with (
+                mock.patch("pycamrec.cli.build_session_report", return_value={"qc": {"status": "pass"}}),
+                mock.patch("pathlib.Path.write_text", side_effect=OSError("disk unavailable")),
+            ):
+                self.assertEqual(cli_main(["report", str(root), "--output", str(output)]), 2)
 
 
 class PixelVerificationTests(unittest.TestCase):
@@ -745,6 +776,67 @@ class PackagingAndEstimateTests(unittest.TestCase):
 
 
 class MetadataAndNamingTests(unittest.TestCase):
+    def test_metadata_json_import_normalizes_session_config_and_scalar_custom_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metadata.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "project": {"project_id": "o", "protocol_id": "p", "assay_id": "8"},
+                        "subject": {
+                            "subject_id": "4",
+                            "species": "mouse",
+                            "postnatal_day": 2,
+                            "weight_g": 4.2,
+                            "genotype": "wt",
+                            "experimental_group": "control",
+                            "sex": "female",
+                        },
+                        "acquisition": {"experimenter_id": "ms", "run_index": 7},
+                        "custom_fields": {"arena_id": "A03", "lighting_lux": 120},
+                        "notes": "loaded",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            document = load_experiment_metadata_json(path)
+            self.assertEqual(document["project"]["assay_id"], "8")
+            self.assertEqual(document["custom_fields"]["arena_id"]["value_type"], "string")
+            self.assertEqual(document["custom_fields"]["lighting_lux"]["value_type"], "integer")
+            self.assertEqual(experiment_metadata_config(document).run_index, 7)
+
+    def test_run_index_increments_only_for_otherwise_identical_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            state = Path(tmp) / "runtime" / "run_index_state.json"
+            document = {
+                "project": {"project_id": "o", "protocol_id": "p", "assay_id": "8"},
+                "subject": {
+                    "subject_id": "4",
+                    "species": "mouse",
+                    "postnatal_day": 2,
+                    "weight_g": 4.2,
+                    "genotype": "wt",
+                    "experimental_group": "control",
+                    "sex": "female",
+                },
+                "acquisition": {"experimenter_id": "ms", "run_index": 1},
+                "custom_fields": {},
+                "notes": "same",
+            }
+            self.assertEqual(next_run_index(root, document, state_path=state), 1)
+            previous = root / "existing" / "experiment_metadata.json"
+            previous.parent.mkdir(parents=True)
+            previous_document = dict(document)
+            previous_document["acquisition"] = {"experimenter_id": "ms", "run_index": 3}
+            previous.write_text(json.dumps(previous_document), encoding="utf-8")
+            self.assertEqual(next_run_index(root, document, state_path=state), 4)
+            record_run_start(state, document, 4)
+            self.assertEqual(next_run_index(root, document, state_path=state), 5)
+            changed = json.loads(json.dumps(document))
+            changed["subject"]["weight_g"] = 4.3
+            self.assertEqual(next_run_index(root, changed, state_path=state), 1)
+
     def test_typed_metadata_validates_weight_pnd_and_custom_fields(self) -> None:
         today = datetime.now(timezone.utc).date()
         metadata = ExperimentMetadataConfig(
@@ -802,7 +894,7 @@ class MetadataAndNamingTests(unittest.TestCase):
                     expected_pixel_format="Mono8",
                     expected_fps=10,
                 ),
-                writer=WriterConfig(expected_bitrate_mbps=1),
+                writer=WriterConfig(expected_bitrate_mbps=1, container="mp4"),
                 recording_profile=RecordingProfileConfig(id="test", pixel_fidelity="lossy"),
                 experiment=experiment,
             )
@@ -828,7 +920,18 @@ class MetadataAndNamingTests(unittest.TestCase):
             relative = writer.session_dir.relative_to(cfg.session.output_root.resolve())
             self.assertEqual(relative.parts[0], "project-social-vision")
             self.assertEqual(relative.parts[1], "subject-mouse-012")
-            self.assertIn("__task-open-field__run-001__sid-", relative.parts[-1])
+            self.assertTrue(relative.parts[2].startswith("task-open-field_"))
+            self.assertRegex(
+                relative.parts[-1],
+                r"^\d{8}T\d{9}Z__subject-mouse-012__P22__task-open-field__run-001$",
+            )
+            session_doc = json.loads((writer.session_dir / "session.json").read_text(encoding="utf-8"))
+            self.assertEqual(session_doc["naming_schema_version"], 2)
+            segment_path = FfmpegSegmentWriter(cfg, writer.segments_dir)._final_path(1)
+            self.assertEqual(
+                segment_path.name,
+                f"{relative.parts[-1]}__segment_000002.mp4",
+            )
             self.assertEqual(discover_session_dirs(cfg.session.output_root), [writer.session_dir])
             output = root / "sessions.csv"
             report = write_session_index(cfg.session.output_root, output)
@@ -836,6 +939,7 @@ class MetadataAndNamingTests(unittest.TestCase):
             with output.open("r", newline="", encoding="utf-8-sig") as handle:
                 row = next(csv.DictReader(handle))
             self.assertEqual(row["subject_id"], "Mouse 012")
+            self.assertEqual(row["naming_schema_version"], "2")
             self.assertEqual(row["weight_g"], "24.3")
             self.assertEqual(row["custom__arena_id"], "A03")
 
@@ -892,6 +996,8 @@ class WriterIntegrationTests(unittest.TestCase):
                 completed.append(final)
             self.assertEqual([item.frame_count for item in completed], [2, 2, 1])
             self.assertTrue(all(Path(item.path).is_file() and Path(item.path).stat().st_size > 0 for item in completed))
+            self.assertTrue(Path(completed[0].path).name.endswith("__segment_000001.mp4"))
+            self.assertTrue(Path(completed[1].path).name.endswith("__segment_000002.mp4"))
             self.assertEqual(list(segments.glob("*.part.*")), [])
             sampled_hashes = _ffmpeg_gray_framemd5_hashes(
                 ffmpeg,
@@ -901,6 +1007,52 @@ class WriterIntegrationTests(unittest.TestCase):
                 timeout_s=30,
             )
             self.assertEqual(len(sampled_hashes), 2)
+
+
+class GuiReadinessTextTests(unittest.TestCase):
+    @staticmethod
+    def _cfg(approval: dict[str, object]) -> SimpleNamespace:
+        return SimpleNamespace(
+            raw={"approval": approval},
+            preview=PreviewConfig(enabled=True),
+            session=SessionConfig(output_root=Path("sessions"), duration_s=60.0),
+            camera=CameraConfig(
+                make="basler_cxp",
+                serial="40559189",
+                pfs_path=Path("camera.pfs"),
+                expected_width=2464,
+                expected_height=2064,
+                expected_pixel_format="Mono8",
+                expected_fps=200,
+            ),
+            writer=WriterConfig(),
+            recording_profile=RecordingProfileConfig(id="analysis_h264_mp4_27m"),
+        )
+
+    def test_candidate_preview_warning_does_not_claim_latest_timing_failure(self) -> None:
+        cfg = self._cfg({"status": "requires_hardware_validation"})
+        warning = _preview_warning_text(cfg)
+        self.assertIn("unapproved candidate", warning)
+        self.assertNotIn("failed the latest timing run", warning)
+        self.assertIn("CANDIDATE", _profile_qualification_text(cfg))
+
+    def test_locked_preview_on_certificate_is_reported_separately(self) -> None:
+        cfg = self._cfg({})
+        fingerprint = build_profile_fingerprint(
+            camera_config=asdict(cfg.camera),
+            writer_config=asdict(cfg.writer),
+            recording_profile=asdict(cfg.recording_profile),
+            preview_config=asdict(cfg.preview),
+        )["fingerprint_sha256"]
+        cfg.raw["approval"] = {
+            "status": "locked_for_evidence_fingerprint",
+            "intended_preview_mode": "on",
+            "validated_max_duration_s": 60,
+            "evidence_fingerprint_sha256": "evidence",
+            "profile_fingerprint_sha256": fingerprint,
+        }
+        self.assertEqual(_preview_warning_text(cfg), "")
+        self.assertIn("LOCK CERTIFICATE PRESENT", _profile_qualification_text(cfg))
 
 
 if __name__ == "__main__":

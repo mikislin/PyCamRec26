@@ -89,6 +89,8 @@ def _session_row(output_root: Path, session_dir: Path, *, include_qc: bool) -> d
         "session_id": session.get("session_id") or metadata.get("automatic", {}).get("session_id") or session_dir.name,
         "created_utc": session.get("created_utc"),
         "relative_session_path": relative_path,
+        "naming_schema_version": session.get("naming_schema_version")
+        or metadata.get("automatic", {}).get("naming_schema_version"),
         "metadata_schema_version": metadata.get("schema_version"),
         "metadata_complete": metadata.get("metadata_complete"),
         "project_id": project.get("project_id"),

@@ -13,6 +13,7 @@ import threading
 import time
 import tkinter as tk
 import base64
+import calendar
 import logging
 from dataclasses import asdict
 from datetime import date, datetime, timezone
@@ -23,7 +24,16 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 from . import __release_stage__, __version__
+from .approval import lock_profile_from_summary
 from .config import load_config
+from .hardware import build_profile_fingerprint
+from .metadata import (
+    experiment_metadata_config,
+    load_experiment_metadata_json,
+    next_run_index,
+    normalize_custom_fields,
+    record_run_start,
+)
 from .onboarding import generate_camera_config
 from .pixel_formats import is_bayer_pixel_format as is_bayer_camera_pixel_format
 from .pixel_formats import is_mono_pixel_format, is_rgb_pixel_format
@@ -47,6 +57,7 @@ GENERATED_CONFIG_DIR = CONFIG_DIR / "generated" if SOURCE_CHECKOUT else USER_DAT
 DEFAULT_OUTPUT_ROOT = Path("D:/PyCamRecSessions")
 RUNTIME_DIR = WORKSPACE_ROOT / ".pycamrec_gui" if SOURCE_CHECKOUT else USER_DATA_ROOT / "runtime"
 PREVIEW_IMAGE_PATH = RUNTIME_DIR / "latest_preview.pgm"
+RUN_INDEX_STATE_PATH = RUNTIME_DIR / "run_index_state.json"
 
 PROFILE_CONFIGS = (
     CONFIG_DIR / "pycamrec_basler_a2A2448_cxp_mono8_cv_optimal.yaml",
@@ -57,12 +68,12 @@ PROFILE_CONFIGS = (
     CONFIG_DIR / "pycamrec_basler_acA1300_usb_mono8_lossless.yaml",
 )
 PROFILE_CHOICES = (
-    ("CXP Mono8 CV-optimal (validation required)", PROFILE_CONFIGS[0]),
-    ("CXP Mono8 near-lossless (validation required)", PROFILE_CONFIGS[1]),
-    ("CXP Mono8 lossless (not locked)", PROFILE_CONFIGS[2]),
-    ("USB Mono8 CV-optimal (validation required)", PROFILE_CONFIGS[3]),
-    ("USB Mono8 near-lossless (validation required)", PROFILE_CONFIGS[4]),
-    ("USB Mono8 lossless (validation required)", PROFILE_CONFIGS[5]),
+    ("CXP Mono8 CV-optimal candidate", PROFILE_CONFIGS[0]),
+    ("CXP Mono8 near-lossless candidate", PROFILE_CONFIGS[1]),
+    ("CXP Mono8 lossless candidate", PROFILE_CONFIGS[2]),
+    ("USB Mono8 CV-optimal candidate", PROFILE_CONFIGS[3]),
+    ("USB Mono8 near-lossless candidate", PROFILE_CONFIGS[4]),
+    ("USB Mono8 lossless candidate", PROFILE_CONFIGS[5]),
 )
 PROFILE_PATH_BY_LABEL = {label: path for label, path in PROFILE_CHOICES}
 PROFILE_LABELS = tuple(label for label, _path in PROFILE_CHOICES)
@@ -85,12 +96,12 @@ METADATA_FIELDS = (
     ("date_of_birth", "Date of birth (YYYY-MM-DD)"),
     ("postnatal_day", "Postnatal day (P0 = birth date)"),
     ("weight_g", "Weight (g)"),
-    ("weight_measured_utc", "Weight measured (ISO-8601, optional)"),
+    ("weight_measured_utc", "Weight measured at (UTC, optional)"),
     ("genotype", "Genotype"),
     ("experimental_group", "Experimental group"),
     ("sex", "Sex"),
     ("experimenter_id", "Experimenter ID"),
-    ("run_index", "Run index"),
+    ("run_index", "Run index (automatic)"),
 )
 REQUIRED_METADATA_FIELDS = {
     "project_id",
@@ -118,6 +129,160 @@ PROGRESS_RE = re.compile(
     r"queue=(?P<queue>\d+)/(?P<queue_max>\d+)\s+gaps=(?P<gaps>\d+)",
     re.IGNORECASE,
 )
+
+
+class _CalendarDialog:
+    """Small dependency-free calendar used for DOB and weight timestamps."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        title: str,
+        initial: str,
+        include_time: bool,
+    ):
+        self.parent = parent
+        self.include_time = include_time
+        now = datetime.now(timezone.utc)
+        selected = now.date()
+        hour, minute = now.hour, now.minute
+        if initial.strip():
+            try:
+                if include_time:
+                    parsed = datetime.fromisoformat(initial.strip().replace("Z", "+00:00"))
+                    if parsed.tzinfo is not None:
+                        parsed = parsed.astimezone(timezone.utc)
+                    selected, hour, minute = parsed.date(), parsed.hour, parsed.minute
+                else:
+                    selected = date.fromisoformat(initial.strip())
+            except ValueError:
+                pass
+        self.selected_date = selected
+        self.visible_year = selected.year
+        self.visible_month = selected.month
+        self.hour_var = tk.StringVar(value=f"{hour:02d}")
+        self.minute_var = tk.StringVar(value=f"{minute:02d}")
+        self.result: str | None = None
+
+        self.window = tk.Toplevel(parent)
+        self.window.title(title)
+        self.window.resizable(False, False)
+        self.window.transient(parent.winfo_toplevel())
+        self.window.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.window.bind("<Escape>", lambda _event: self._cancel())
+
+        navigation = ttk.Frame(self.window, padding=(8, 8, 8, 2))
+        navigation.pack(fill=tk.X)
+        ttk.Button(navigation, text="<", width=3, command=lambda: self._move_month(-1)).pack(side=tk.LEFT)
+        self.month_var = tk.StringVar()
+        ttk.Label(navigation, textvariable=self.month_var, anchor=tk.CENTER, width=20).pack(
+            side=tk.LEFT, expand=True, padx=8
+        )
+        ttk.Button(navigation, text=">", width=3, command=lambda: self._move_month(1)).pack(side=tk.RIGHT)
+
+        self.calendar_frame = ttk.Frame(self.window, padding=(8, 2, 8, 4))
+        self.calendar_frame.pack(fill=tk.BOTH)
+
+        if include_time:
+            time_frame = ttk.Frame(self.window, padding=(8, 2))
+            time_frame.pack(fill=tk.X)
+            ttk.Label(time_frame, text="Time (UTC)").pack(side=tk.LEFT)
+            ttk.Spinbox(time_frame, from_=0, to=23, wrap=True, width=4, textvariable=self.hour_var).pack(
+                side=tk.LEFT, padx=(8, 2)
+            )
+            ttk.Label(time_frame, text=":").pack(side=tk.LEFT)
+            ttk.Spinbox(time_frame, from_=0, to=59, wrap=True, width=4, textvariable=self.minute_var).pack(
+                side=tk.LEFT, padx=(2, 0)
+            )
+
+        actions = ttk.Frame(self.window, padding=(8, 4, 8, 8))
+        actions.pack(fill=tk.X)
+        ttk.Button(actions, text="Today", command=self._today).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
+        ttk.Button(
+            actions,
+            text="Use selected date/time" if include_time else "Use selected date",
+            command=self._accept,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+        self._render_month()
+
+    def show(self) -> str | None:
+        self.window.grab_set()
+        self.window.wait_visibility()
+        self.window.focus_set()
+        self.parent.wait_window(self.window)
+        return self.result
+
+    def _render_month(self) -> None:
+        for child in self.calendar_frame.winfo_children():
+            child.destroy()
+        self.month_var.set(f"{calendar.month_name[self.visible_month]} {self.visible_year}")
+        for column, label in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")):
+            ttk.Label(self.calendar_frame, text=label, anchor=tk.CENTER, width=4).grid(
+                row=0, column=column, padx=1, pady=1
+            )
+        weeks = calendar.Calendar(firstweekday=0).monthdayscalendar(self.visible_year, self.visible_month)
+        for row, week in enumerate(weeks, start=1):
+            for column, day_number in enumerate(week):
+                if day_number == 0:
+                    ttk.Label(self.calendar_frame, text="", width=4).grid(row=row, column=column)
+                    continue
+                style = "SelectedDay.TButton" if (
+                    self.selected_date.year == self.visible_year
+                    and self.selected_date.month == self.visible_month
+                    and self.selected_date.day == day_number
+                ) else "TButton"
+                ttk.Button(
+                    self.calendar_frame,
+                    text=str(day_number),
+                    width=4,
+                    style=style,
+                    command=lambda value=day_number: self._select_day(value),
+                ).grid(row=row, column=column, padx=1, pady=1)
+
+    def _select_day(self, day_number: int) -> None:
+        self.selected_date = date(self.visible_year, self.visible_month, day_number)
+        self._render_month()
+
+    def _move_month(self, offset: int) -> None:
+        absolute = self.visible_year * 12 + self.visible_month - 1 + offset
+        self.visible_year, month_zero = divmod(absolute, 12)
+        self.visible_month = month_zero + 1
+        self._render_month()
+
+    def _today(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.selected_date = now.date()
+        self.visible_year, self.visible_month = now.year, now.month
+        if self.include_time:
+            self.hour_var.set(f"{now.hour:02d}")
+            self.minute_var.set(f"{now.minute:02d}")
+        self._render_month()
+
+    def _accept(self) -> None:
+        if self.include_time:
+            try:
+                hour = int(self.hour_var.get())
+                minute = int(self.minute_var.get())
+                selected = datetime.combine(
+                    self.selected_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                ).replace(hour=hour, minute=minute)
+            except (TypeError, ValueError):
+                messagebox.showerror("Invalid time", "Hour must be 0-23 and minute 0-59.", parent=self.window)
+                return
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                messagebox.showerror("Invalid time", "Hour must be 0-23 and minute 0-59.", parent=self.window)
+                return
+            self.result = selected.isoformat(timespec="minutes").replace("+00:00", "Z")
+        else:
+            self.result = self.selected_date.isoformat()
+        self.window.destroy()
+
+    def _cancel(self) -> None:
+        self.window.destroy()
 
 
 class PyCamRecApp:
@@ -155,6 +320,7 @@ class PyCamRecApp:
         self.preview_render_slot = 0
         self.preview_numpy: Any | None = None
         self.preview_cv2: Any | bool | None = None
+        self.run_index_refresh_job: str | None = None
         self.onboard_detected_serial = ""
         self.onboard_detected_capabilities: dict[str, Any] = {}
 
@@ -188,10 +354,13 @@ class PyCamRecApp:
         self.session_var = tk.StringVar(value="")
         self.qc_status_var = tk.StringVar(value="Not run")
         self.profile_summary_var = tk.StringVar(value="")
+        self.profile_qualification_var = tk.StringVar(value="Profile qualification not checked")
+        self.setup_readiness_var = tk.StringVar(value="Current recording setup not checked")
         self.disk_estimate_var = tk.StringVar(value="Disk estimate pending")
         self.preview_warning_var = tk.StringVar(value="")
         self.preview_status_var = tk.StringVar(value="Preview panel ready")
         self.metadata_status_var = tk.StringVar(value="Fields default to UNSPECIFIED until filled.")
+        self.metadata_source_var = tk.StringVar(value="Metadata entered manually")
 
         metadata_defaults = {"species": "mouse", "run_index": "1"}
         self.metadata_vars = {
@@ -241,6 +410,7 @@ class PyCamRecApp:
         style.configure("Fail.TLabel", foreground="#b00020", font=("Segoe UI", 10, "bold"))
         style.configure("Warn.TLabel", foreground="#9a5b00", font=("Segoe UI", 10, "bold"))
         style.configure("Warning.TLabel", foreground="#9a5b00", font=("Segoe UI", 9, "bold"))
+        style.configure("SelectedDay.TButton", font=("Segoe UI", 9, "bold"))
 
     def _build_layout(self) -> None:
         container = ttk.Frame(self.root, padding=10)
@@ -385,7 +555,7 @@ class PyCamRecApp:
         )
         self.setup_preview_stop_button.pack(side=tk.LEFT, padx=(4, 4))
         self.preview_stop_buttons.append(self.setup_preview_stop_button)
-        ttk.Label(preview_frame, text="512/20 is live-view target; preview-on runs still need QC.").pack(
+        ttk.Label(preview_frame, text="512/10 is the lightweight live-view target.").pack(
             side=tk.LEFT,
             padx=(14, 4),
         )
@@ -410,6 +580,28 @@ class PyCamRecApp:
         ttk.Label(frame, text="Selected profile", style="Header.TLabel").pack(anchor=tk.W, pady=(14, 4))
         ttk.Label(frame, textvariable=self.profile_summary_var, wraplength=520, justify=tk.LEFT).pack(fill=tk.X)
 
+        readiness = ttk.LabelFrame(frame, text="Readiness checks (independent)", padding=8)
+        readiness.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(readiness, text="Profile qualification", style="Small.TLabel").grid(
+            row=0, column=0, sticky=tk.NW, padx=(0, 8)
+        )
+        ttk.Label(
+            readiness,
+            textvariable=self.profile_qualification_var,
+            wraplength=410,
+            justify=tk.LEFT,
+        ).grid(row=0, column=1, sticky=tk.W)
+        ttk.Label(readiness, text="Current setup", style="Small.TLabel").grid(
+            row=1, column=0, sticky=tk.NW, padx=(0, 8), pady=(6, 0)
+        )
+        ttk.Label(
+            readiness,
+            textvariable=self.setup_readiness_var,
+            wraplength=410,
+            justify=tk.LEFT,
+        ).grid(row=1, column=1, sticky=tk.W, pady=(6, 0))
+        readiness.columnconfigure(1, weight=1)
+
         buttons = ttk.Frame(frame)
         buttons.pack(fill=tk.X, pady=(18, 0))
         ttk.Button(buttons, text="Preflight", command=self.run_preflight).pack(side=tk.LEFT)
@@ -422,14 +614,17 @@ class PyCamRecApp:
 
     def _build_metadata_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(frame, text="Metadata")
+        self.notebook.add(frame, text="Recording metadata")
 
-        ttk.Label(frame, text="Experiment metadata", style="Header.TLabel").grid(
+        ttk.Label(frame, text="Current recording metadata", style="Header.TLabel").grid(
             row=0,
             column=0,
-            columnspan=4,
+            columnspan=2,
             sticky=tk.W,
             pady=(0, 8),
+        )
+        ttk.Label(frame, textvariable=self.metadata_source_var, style="Small.TLabel").grid(
+            row=0, column=2, columnspan=2, sticky=tk.E, pady=(0, 8)
         )
         field_rows = (len(METADATA_FIELDS) + 1) // 2
         for index, (field_name, label) in enumerate(METADATA_FIELDS):
@@ -442,6 +637,32 @@ class PyCamRecApp:
                     textvariable=self.metadata_vars[field_name],
                     values=("female", "male", "intersex", "unknown", "not_applicable"),
                     state="readonly",
+                )
+            elif field_name in {"date_of_birth", "weight_measured_utc"}:
+                widget = ttk.Frame(frame)
+                ttk.Entry(widget, textvariable=self.metadata_vars[field_name]).pack(
+                    side=tk.LEFT, fill=tk.X, expand=True
+                )
+                ttk.Button(
+                    widget,
+                    text="Select...",
+                    command=lambda name=field_name: self.select_metadata_date(name),
+                ).pack(side=tk.LEFT, padx=(4, 0))
+                ttk.Button(
+                    widget,
+                    text="Today" if field_name == "date_of_birth" else "Now",
+                    command=lambda name=field_name: self.set_metadata_date_today(name),
+                ).pack(side=tk.LEFT, padx=(4, 0))
+            elif field_name == "run_index":
+                widget = ttk.Frame(frame)
+                ttk.Entry(
+                    widget,
+                    textvariable=self.metadata_vars[field_name],
+                    state="readonly",
+                    width=8,
+                ).pack(side=tk.LEFT)
+                ttk.Button(widget, text="Recalculate", command=self._set_next_run_index).pack(
+                    side=tk.LEFT, padx=(4, 0)
                 )
             else:
                 widget = ttk.Entry(frame, textvariable=self.metadata_vars[field_name])
@@ -460,9 +681,10 @@ class PyCamRecApp:
         self.custom_fields_text = tk.Text(custom_container, height=3, wrap=tk.NONE)
         self.custom_fields_text.pack(fill=tk.BOTH, expand=True)
         self.custom_fields_text.insert("1.0", '{}')
+        self.custom_fields_text.bind("<FocusOut>", lambda _event: self._schedule_run_index_refresh())
         ttk.Label(
             custom_container,
-            text='Example: {"arena_id":"A03", "lighting_lux":120}',
+            text='Shorthand is accepted and typed automatically, e.g. {"arena_id":"A03", "lighting_lux":120}.',
             style="Small.TLabel",
         ).pack(anchor=tk.W)
 
@@ -470,9 +692,12 @@ class PyCamRecApp:
         ttk.Label(frame, text="Notes").grid(row=notes_row, column=0, sticky=tk.NW, pady=3)
         self.notes_text = tk.Text(frame, height=4, wrap=tk.WORD)
         self.notes_text.grid(row=notes_row, column=1, columnspan=3, sticky=tk.NSEW, pady=3, padx=(8, 0))
+        self.notes_text.bind("<FocusOut>", lambda _event: self._schedule_run_index_refresh())
 
         buttons = ttk.Frame(frame)
         buttons.grid(row=notes_row + 1, column=1, columnspan=3, sticky=tk.W, pady=(10, 0), padx=(8, 0))
+        ttk.Button(buttons, text="Load JSON...", command=self.load_metadata_json).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Save JSON...", command=self.save_metadata_json).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(buttons, text="Check metadata", command=self.check_metadata).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Reset", command=self.reset_metadata).pack(side=tk.LEFT, padx=(8, 0))
 
@@ -491,15 +716,24 @@ class PyCamRecApp:
 
     def _build_validation_tab(self) -> None:
         frame = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(frame, text="Validate")
+        self.notebook.add(frame, text="Profile qualification")
 
-        ttk.Label(frame, text="Camera onboarding and evidence validation", style="Header.TLabel").grid(
+        ttk.Label(frame, text="Recording-profile qualification", style="Header.TLabel").grid(
             row=0,
             column=0,
-            columnspan=3,
+            columnspan=1,
             sticky=tk.W,
             pady=(0, 8),
         )
+        ttk.Label(
+            frame,
+            text=(
+                "This tab validates encoder/camera performance and can create evidence for a hardware-specific "
+                "profile lock. It does not supply metadata for an experimental recording."
+            ),
+            wraplength=650,
+            justify=tk.LEFT,
+        ).grid(row=0, column=1, columnspan=2, sticky=tk.W, pady=(0, 8), padx=(8, 0))
         ttk.Label(frame, text="Pixel type").grid(row=1, column=0, sticky=tk.W, pady=3)
         self.onboard_pixel_combo = ttk.Combobox(
             frame,
@@ -572,11 +806,24 @@ class PyCamRecApp:
 
         buttons = ttk.Frame(frame)
         buttons.grid(row=10, column=1, columnspan=2, sticky=tk.W, pady=(12, 4), padx=(8, 4))
-        ttk.Button(buttons, text="Detect camera caps", command=self.detect_camera_capabilities).pack(side=tk.LEFT)
-        ttk.Button(buttons, text="Generate config", command=self.generate_onboarding_config).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(buttons, text="Run validation sweep", command=self.run_onboarding_sweep).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(buttons, text="Verify last pixels", command=self.verify_last_session_pixels).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(buttons, text="Open sweeps", command=self.open_validation_sweeps).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="Detect camera caps", command=self.detect_camera_capabilities).grid(
+            row=0, column=0, sticky=tk.W
+        )
+        ttk.Button(buttons, text="Generate candidate config", command=self.generate_onboarding_config).grid(
+            row=0, column=1, sticky=tk.W, padx=(8, 0)
+        )
+        ttk.Button(buttons, text="Run qualification sweep", command=self.run_onboarding_sweep).grid(
+            row=0, column=2, sticky=tk.W, padx=(8, 0)
+        )
+        ttk.Button(buttons, text="Create locked config...", command=self.create_locked_config).grid(
+            row=1, column=0, sticky=tk.W, pady=(6, 0)
+        )
+        ttk.Button(buttons, text="Verify last pixels", command=self.verify_last_session_pixels).grid(
+            row=1, column=1, sticky=tk.W, padx=(8, 0), pady=(6, 0)
+        )
+        ttk.Button(buttons, text="Open sweeps", command=self.open_validation_sweeps).grid(
+            row=1, column=2, sticky=tk.W, padx=(8, 0), pady=(6, 0)
+        )
 
         ttk.Label(frame, textvariable=self.onboard_status_var, wraplength=560, justify=tk.LEFT).grid(
             row=11,
@@ -605,7 +852,8 @@ class PyCamRecApp:
         top = ttk.Frame(frame)
         top.pack(fill=tk.X)
         ttk.Button(top, text="Refresh", command=self.refresh_sessions).pack(side=tk.LEFT)
-        ttk.Button(top, text="Generate report", command=self.generate_selected_report).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(top, text="Review report", command=self.generate_selected_report).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(top, text="Save report JSON...", command=self.save_selected_report).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(top, text="Open folder", command=self.open_selected_session_folder).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(top, text="Open video segments", command=self.open_selected_video_segments).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(top, text="Open metadata", command=self.open_selected_metadata).pack(side=tk.LEFT, padx=(8, 0))
@@ -705,8 +953,23 @@ class PyCamRecApp:
             var.trace_add("write", lambda *_args: self.root.after_idle(self._load_profile_summary))
         self.preview_enabled_var.trace_add("write", lambda *_args: self.root.after_idle(self._load_profile_summary))
         self.allow_unspecified_var.trace_add("write", lambda *_args: self.root.after_idle(self._refresh_start_state))
-        for var in self.metadata_vars.values():
+        for field_name, var in self.metadata_vars.items():
             var.trace_add("write", lambda *_args: self.root.after_idle(self._refresh_start_state))
+            if field_name != "run_index":
+                var.trace_add("write", lambda *_args: self._schedule_run_index_refresh())
+        self.output_root_var.trace_add("write", lambda *_args: self._schedule_run_index_refresh())
+
+    def _schedule_run_index_refresh(self) -> None:
+        if self.run_index_refresh_job is not None:
+            try:
+                self.root.after_cancel(self.run_index_refresh_job)
+            except tk.TclError:
+                pass
+        self.run_index_refresh_job = self.root.after(350, self._refresh_run_index_silently)
+
+    def _refresh_run_index_silently(self) -> None:
+        self.run_index_refresh_job = None
+        self._set_next_run_index(show_error=False)
 
     def _on_profile_choice(self) -> None:
         path = PROFILE_PATH_BY_LABEL.get(self.profile_choice_var.get())
@@ -729,7 +992,15 @@ class PyCamRecApp:
         setup_preview_running = self._setup_preview_running()
         validation_running = self.validation_process is not None and self.validation_process.poll() is None
         missing = self._missing_metadata_fields()
-        metadata_ok = not missing or self.allow_unspecified_var.get()
+        semantic_issues: list[str] = []
+        try:
+            experiment = experiment_metadata_config(self._metadata_values())
+            semantic_issues = experiment.validation_issues(
+                recording_date=datetime.now(timezone.utc).date()
+            )
+        except Exception as exc:
+            semantic_issues = [str(exc)]
+        metadata_ok = (not missing or self.allow_unspecified_var.get()) and not semantic_issues
         state = tk.NORMAL if metadata_ok and not process_running and not setup_preview_running and not validation_running else tk.DISABLED
         for button in self.start_buttons:
             button.configure(state=state)
@@ -740,16 +1011,30 @@ class PyCamRecApp:
         for button in self.preview_stop_buttons:
             button.configure(state=preview_stop_state)
         if process_running:
+            self.setup_readiness_var.set("RECORDING — setup is frozen until safe finalization.")
             return
         if setup_preview_running:
             self.metadata_status_var.set("Setup preview is active. Stop preview before recording.")
+            self.setup_readiness_var.set("SETUP PREVIEW — metadata is not being recorded.")
             return
-        if missing and self.allow_unspecified_var.get():
+        if semantic_issues:
+            self.metadata_status_var.set("Metadata invalid: " + "; ".join(semantic_issues))
+            self.setup_readiness_var.set("BLOCKED — metadata values are inconsistent or invalid.")
+        elif missing and self.allow_unspecified_var.get():
             self.metadata_status_var.set("Engineering mode: metadata incomplete but recording is allowed.")
+            self.setup_readiness_var.set(
+                "ENGINEERING ONLY — incomplete metadata is allowed; output is not experiment-ready."
+            )
         elif missing:
             self.metadata_status_var.set("Start disabled until metadata is complete: " + ", ".join(missing))
+            self.setup_readiness_var.set(
+                f"BLOCKED — complete {len(missing)} required metadata field(s) in Recording metadata."
+            )
         else:
             self.metadata_status_var.set("Metadata complete.")
+            self.setup_readiness_var.set(
+                "METADATA READY — run Preflight to check storage, PFS, encoder, and current profile coverage."
+            )
 
     def refresh_devices(self) -> None:
         self.device_status_var.set("Checking pylon devices...")
@@ -800,6 +1085,135 @@ class PyCamRecApp:
             self.output_root_var.set(path)
             self.refresh_sessions()
             self._load_profile_summary()
+
+    def load_metadata_json(self) -> None:
+        path = filedialog.askopenfilename(
+            initialdir=str(self.last_session_dir or WORKSPACE_ROOT),
+            title="Load experiment metadata",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            document = load_experiment_metadata_json(Path(path))
+            self._apply_metadata_document(document)
+            self._set_next_run_index()
+        except Exception as exc:
+            messagebox.showerror("Could not load metadata", str(exc))
+            return
+        self.metadata_source_var.set(f"Loaded: {Path(path).name}")
+        self.check_metadata()
+
+    def save_metadata_json(self) -> None:
+        try:
+            self._set_next_run_index()
+            document = self._metadata_values()
+        except Exception as exc:
+            messagebox.showerror("Could not prepare metadata", str(exc))
+            return
+        path = filedialog.asksaveasfilename(
+            initialdir=str(WORKSPACE_ROOT),
+            initialfile="experiment_metadata.json",
+            defaultextension=".json",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+            title="Save experiment metadata",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(
+                json.dumps(document, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            messagebox.showerror("Could not save metadata", str(exc))
+            return
+        self.metadata_source_var.set(f"Saved: {Path(path).name}")
+
+    def _apply_metadata_document(self, document: dict[str, Any]) -> None:
+        project = document.get("project") or {}
+        subject = document.get("subject") or {}
+        acquisition = document.get("acquisition") or {}
+        values = {
+            "project_id": project.get("project_id"),
+            "protocol_id": project.get("protocol_id"),
+            "assay_id": project.get("assay_id"),
+            "subject_id": subject.get("subject_id"),
+            "species": subject.get("species"),
+            "date_of_birth": subject.get("date_of_birth"),
+            "postnatal_day": subject.get("postnatal_day"),
+            "weight_g": subject.get("weight_g"),
+            "weight_measured_utc": subject.get("weight_measured_utc"),
+            "genotype": subject.get("genotype"),
+            "experimental_group": subject.get("experimental_group"),
+            "sex": subject.get("sex"),
+            "experimenter_id": acquisition.get("experimenter_id"),
+            "run_index": acquisition.get("run_index", 1),
+        }
+        for field_name, value in values.items():
+            self.metadata_vars[field_name].set("" if value is None else str(value))
+        if self.custom_fields_text is not None:
+            self.custom_fields_text.delete("1.0", tk.END)
+            self.custom_fields_text.insert(
+                "1.0",
+                json.dumps(document.get("custom_fields") or {}, indent=2, sort_keys=True),
+            )
+        if self.notes_text is not None:
+            self.notes_text.delete("1.0", tk.END)
+            self.notes_text.insert("1.0", str(document.get("notes") or ""))
+
+    def select_metadata_date(self, field_name: str) -> None:
+        include_time = field_name == "weight_measured_utc"
+        dialog = _CalendarDialog(
+            self.root,
+            title="Weight measurement date/time" if include_time else "Date of birth",
+            initial=self.metadata_vars[field_name].get(),
+            include_time=include_time,
+        )
+        selected = dialog.show()
+        if selected is None:
+            return
+        self.metadata_vars[field_name].set(selected)
+        if field_name == "date_of_birth":
+            self._derive_postnatal_day_from_dob()
+        self._refresh_start_state()
+
+    def set_metadata_date_today(self, field_name: str) -> None:
+        now = datetime.now(timezone.utc)
+        if field_name == "date_of_birth":
+            self.metadata_vars[field_name].set(now.date().isoformat())
+            self._derive_postnatal_day_from_dob()
+        else:
+            self.metadata_vars[field_name].set(
+                now.isoformat(timespec="seconds").replace("+00:00", "Z")
+            )
+        self._refresh_start_state()
+
+    def _derive_postnatal_day_from_dob(self) -> None:
+        try:
+            birth_date = date.fromisoformat(self.metadata_vars["date_of_birth"].get().strip())
+        except ValueError:
+            return
+        age_days = (datetime.now(timezone.utc).date() - birth_date).days
+        if age_days >= 0:
+            self.metadata_vars["postnatal_day"].set(str(age_days))
+
+    def _set_next_run_index(self, *, show_error: bool = True) -> int | None:
+        try:
+            if not self.metadata_vars["run_index"].get().strip():
+                self.metadata_vars["run_index"].set("1")
+            document = self._metadata_values()
+            run_index = next_run_index(
+                Path(self.output_root_var.get()),
+                document,
+                state_path=RUN_INDEX_STATE_PATH,
+            )
+        except Exception as exc:
+            if show_error:
+                self.setup_readiness_var.set(f"Run index unavailable: {exc}")
+            return None
+        self.metadata_vars["run_index"].set(str(run_index))
+        return run_index
 
     def generate_onboarding_config(self) -> None:
         try:
@@ -1010,6 +1424,54 @@ class PyCamRecApp:
         self.validation_reader_thread = threading.Thread(target=self._read_validation_output, daemon=True)
         self.validation_reader_thread.start()
 
+    def create_locked_config(self) -> None:
+        summary_path = filedialog.askopenfilename(
+            initialdir=str(WORKSPACE_ROOT / "validation_sweeps"),
+            title="Select passing validation_summary.json",
+            filetypes=(("Validation summary", "validation_summary.json"), ("JSON files", "*.json")),
+        )
+        if not summary_path:
+            return
+        preview_choice = messagebox.askyesnocancel(
+            "Lock preview mode",
+            "Create a lock for preview ON?\n\nYes = preview on\nNo = preview off\nCancel = stop",
+        )
+        if preview_choice is None:
+            return
+        preview_mode = "on" if preview_choice else "off"
+        approved_dir = WORKSPACE_ROOT / "configs" / "approved"
+        approved_dir.mkdir(parents=True, exist_ok=True)
+        source_stem = Path(self.config_var.get()).stem
+        output_path = filedialog.asksaveasfilename(
+            initialdir=str(approved_dir),
+            initialfile=f"{source_stem}_preview_{preview_mode}_approved.yaml",
+            defaultextension=".yaml",
+            filetypes=(("YAML files", "*.yaml"), ("All files", "*.*")),
+            title="Save hardware-specific locked config",
+        )
+        if not output_path:
+            return
+        try:
+            result = lock_profile_from_summary(
+                Path(self.config_var.get()),
+                Path(summary_path),
+                Path(output_path),
+                preview_mode=preview_mode,
+            )
+        except Exception as exc:
+            messagebox.showerror("Profile was not lockable", str(exc))
+            return
+        self.config_var.set(str(Path(output_path).resolve()))
+        self.profile_choice_var.set(CUSTOM_PROFILE_LABEL)
+        self.camera_profile_var.set("")
+        self.preview_enabled_var.set(preview_choice)
+        self.onboard_status_var.set(
+            f"Created and selected {preview_mode} locked config:\n{output_path}\n"
+            "Recording startup will still verify the live hardware/software fingerprint."
+        )
+        self._append_output("\n=== Locked profile config ===\n" + json.dumps(result, indent=2) + "\n")
+        self._load_profile_summary()
+
     def verify_last_session_pixels(self) -> None:
         session = self._selected_or_last_session()
         if session is None:
@@ -1036,7 +1498,9 @@ class PyCamRecApp:
             self.custom_fields_text.insert("1.0", "{}")
         if self.notes_text is not None:
             self.notes_text.delete("1.0", tk.END)
+        self.metadata_source_var.set("Metadata entered manually")
         self.metadata_status_var.set("Fields reset to UNSPECIFIED.")
+        self._set_next_run_index()
         self._refresh_start_state()
 
     def check_metadata(self) -> bool:
@@ -1073,8 +1537,16 @@ class PyCamRecApp:
         self.logger.info("Preflight completed with %s warning(s)", len(report.warnings))
         if report.warnings:
             self.status_var.set(f"Preflight: {len(report.warnings)} warning(s)")
+            self.setup_readiness_var.set(
+                f"PREFLIGHT COMPLETE — {len(report.warnings)} advisory warning(s); review the command output. "
+                "The recorder verifies the camera and any approval certificate after opening the device."
+            )
         else:
             self.status_var.set("Preflight OK")
+            self.setup_readiness_var.set(
+                "PREFLIGHT PASSED — storage, PFS, encoder, and metadata checks passed. "
+                "Any hardware-specific profile lock is verified after the camera opens."
+            )
 
     def start_setup_preview(self) -> None:
         if self._setup_preview_running():
@@ -1199,6 +1671,9 @@ class PyCamRecApp:
             return
 
         try:
+            run_index = self._set_next_run_index()
+            if run_index is None:
+                raise ValueError("Could not calculate the next run index.")
             runtime_config = self._write_runtime_config()
             cfg = load_config(runtime_config)
             device_report = _run_pycamrec_json(["devices"], timeout_s=45)
@@ -1246,6 +1721,16 @@ class PyCamRecApp:
             self.process = None
             messagebox.showerror("Could not start recording", str(exc))
             return
+
+        try:
+            record_run_start(
+                RUN_INDEX_STATE_PATH,
+                cfg.raw.get("experiment") if isinstance(cfg.raw, dict) else self._metadata_values(),
+                cfg.experiment.run_index,
+            )
+        except Exception as exc:
+            self.logger.warning("Could not persist automatic run index: %r", exc)
+            self._append_output(f"WARNING: Could not persist automatic run index: {exc}\n")
 
         self.current_runtime_config = runtime_config
         self.record_started_at = time.perf_counter()
@@ -1339,6 +1824,43 @@ class PyCamRecApp:
             messagebox.showinfo("No session", "Select a session first.")
             return
         self._show_report(session)
+
+    def save_selected_report(self) -> None:
+        session = self._selected_or_last_session()
+        if session is None:
+            messagebox.showinfo("No session", "Select a session first.")
+            return
+        try:
+            report = build_session_report(session)
+        except Exception as exc:
+            messagebox.showerror("Report failed", str(exc))
+            return
+        output_path = filedialog.asksaveasfilename(
+            initialdir=str(session),
+            initialfile="scientific_report.json",
+            defaultextension=".json",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+            title="Save scientific report",
+        )
+        if not output_path:
+            return
+        path = Path(output_path)
+        if path.exists():
+            messagebox.showerror(
+                "Report already exists",
+                "PyCamRec will not overwrite an existing report. Choose a new filename.",
+            )
+            return
+        try:
+            path.write_text(
+                json.dumps(_jsonable(report), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            messagebox.showerror("Could not save report", str(exc))
+            return
+        self._display_report(session, report, append_output=False)
+        self.status_var.set(f"Report saved: {path.name}")
 
     def _show_report(self, session_dir: Path) -> None:
         try:
@@ -1517,6 +2039,7 @@ class PyCamRecApp:
             )
         except Exception as exc:
             self.profile_summary_var.set(f"Could not load profile: {exc}")
+            self.profile_qualification_var.set("INVALID — selected profile config could not be loaded.")
             self.disk_estimate_var.set("Disk estimate unavailable until the profile loads.")
             self.preview_warning_var.set("")
             self._refresh_start_state()
@@ -1548,13 +2071,20 @@ class PyCamRecApp:
             segment_seconds = cfg.writer.segment_seconds
         self.profile_summary_var.set(
             f"{profile.display_name} | {profile.pixel_fidelity} | "
-            f"{profile.validation_status} | target {cfg.writer.expected_bitrate_mbps} Mbps\n"
+            f"target {cfg.writer.expected_bitrate_mbps} Mbps\n"
             f"Camera {cfg.camera.make} serial {cfg.camera.serial} | "
             f"{cfg.camera.expected_pixel_format} {cfg.camera.expected_width}x{cfg.camera.expected_height} "
             f"@ {cfg.camera.expected_fps:g} fps | output .{cfg.writer.container} | segment {segment_seconds:g}s\n"
             f"Temperature warning/critical {cfg.camera.temperature_warning_c:g}/"
             f"{cfg.camera.temperature_critical_c:g} C; health checks every "
             f"{cfg.camera.health_check_interval_s:g}s. {profile.recommended_use}"
+        )
+        self.profile_qualification_var.set(
+            _profile_qualification_text(
+                cfg,
+                camera_profile_path=self.camera_profile_var.get().strip() or None,
+                segment_seconds=segment_seconds,
+            )
         )
         self.disk_estimate_var.set(_disk_estimate_text(cfg))
         self.preview_warning_var.set(_preview_warning_text(cfg))
@@ -1720,6 +2250,7 @@ class PyCamRecApp:
             raise ValueError(f"Custom fields must be valid JSON: {exc.msg}") from exc
         if not isinstance(custom_fields, dict):
             raise ValueError("Custom fields JSON must be an object.")
+        custom_fields = normalize_custom_fields(custom_fields)
         postnatal_day_source = "manual"
         if values["date_of_birth"] and postnatal_day is not None:
             try:
@@ -1931,8 +2462,9 @@ class PyCamRecApp:
         if return_code == 0:
             self.status_var.set("Validation completed")
             self.onboard_status_var.set(
-                "Validation sweep completed with at least one QC pass. Review the preview-mode-specific "
-                "lock recommendation before writing an approval fingerprint into a config."
+                "Qualification process completed. Exit code 0 does not mean the profile is approved: "
+                "review validation_summary.json for metadata/task-quality gates and the preview-mode-specific "
+                "lock recommendation, then create and load a locked config."
             )
         else:
             self.status_var.set(f"Validation exited with code {return_code}")
@@ -1955,6 +2487,7 @@ class PyCamRecApp:
         self._append_output(f"=== Recording process exited with code {return_code} ===\n")
         self.logger.info("Recording exited with code %s", return_code)
         self.refresh_sessions()
+        self._set_next_run_index()
         self._refresh_start_state()
         if return_code == 0 and self.last_session_dir is not None:
             try:
@@ -2406,23 +2939,78 @@ def _disk_probe_path(path: Path) -> Path:
     return current
 
 
+def _profile_qualification_text(
+    cfg: Any,
+    *,
+    camera_profile_path: str | None = None,
+    segment_seconds: float | None = None,
+) -> str:
+    approval = cfg.raw.get("approval") if isinstance(cfg.raw, dict) else {}
+    approval = approval if isinstance(approval, dict) else {}
+    status = str(approval.get("status") or "requires_hardware_validation")
+    if not status.startswith("locked"):
+        return (
+            "CANDIDATE — this YAML defines recording settings but is not an approval. "
+            "Qualify it on the Profile qualification tab, create a locked config from the passing summary, "
+            "and then select that locked config for experiments."
+        )
+    configured_evidence = str(approval.get("evidence_fingerprint_sha256") or "")
+    configured_profile = str(approval.get("profile_fingerprint_sha256") or "")
+    intended_mode = str(approval.get("intended_preview_mode") or "off").strip().lower()
+    current_mode = "on" if cfg.preview.enabled else "off"
+    validated_duration = approval.get("validated_max_duration_s")
+    if not configured_evidence or not configured_profile or intended_mode not in {"on", "off"}:
+        return "INVALID CERTIFICATE — required fingerprint or intended-preview fields are missing."
+    try:
+        duration_covered = validated_duration is not None and cfg.session.duration_s <= float(validated_duration)
+    except (TypeError, ValueError):
+        duration_covered = False
+    mode_covered = intended_mode == current_mode
+    camera_config = asdict(cfg.camera)
+    if camera_profile_path:
+        camera_config["pfs_path"] = str(Path(camera_profile_path).expanduser().resolve())
+    writer_config = asdict(cfg.writer)
+    if segment_seconds is not None:
+        writer_config["segment_seconds"] = float(segment_seconds)
+    current_profile = build_profile_fingerprint(
+        camera_config=camera_config,
+        writer_config=writer_config,
+        recording_profile=asdict(cfg.recording_profile),
+        preview_config=asdict(cfg.preview),
+    )["fingerprint_sha256"]
+    settings_covered = configured_profile == current_profile
+    if not mode_covered or not duration_covered or not settings_covered:
+        limits = f"preview {intended_mode}, maximum {validated_duration}s"
+        mismatch = " Resolved camera/writer/preview settings differ from the certificate." if not settings_covered else ""
+        return (
+            f"NOT COVERED BY CERTIFICATE — locked evidence is for {limits}; current setup is "
+            f"preview {current_mode}, {cfg.session.duration_s:g}s.{mismatch}"
+        )
+    return (
+        f"LOCK CERTIFICATE PRESENT — covers preview {intended_mode} through {float(validated_duration):g}s. "
+        "Camera/PFS/GPU/driver/host/software fingerprints are verified after the camera opens."
+    )
+
+
 def _preview_warning_text(cfg: Any) -> str:
     if not cfg.preview.enabled:
         return ""
-    if cfg.camera.make == "basler_cxp" and cfg.camera.expected_fps >= 150:
+    approval = cfg.raw.get("approval") if isinstance(cfg.raw, dict) else {}
+    approval = approval if isinstance(approval, dict) else {}
+    status = str(approval.get("status") or "")
+    intended_mode = str(approval.get("intended_preview_mode") or "off").strip().lower()
+    if status.startswith("locked") and intended_mode != "on":
         return (
-            "Preview-on CXP MP4 failed the latest timing run. Use setup preview for positioning, "
-            "then record scientific CXP MP4 runs with preview off until a validation sweep passes."
+            "Preview is ON, but the selected lock certificate covers preview OFF. "
+            "Turn preview off or load/produce a preview-on locked config."
         )
-    if cfg.recording_profile.id in SCIENTIFIC_PREVIEW_PROFILE_IDS:
+    if not status.startswith("locked") and cfg.recording_profile.id in SCIENTIFIC_PREVIEW_PROFILE_IDS:
         return (
-            "Preview is enabled for a scientific recording profile. Use it for positioning, "
-            "then validate important runs with preview off if QC reports host-timing pressure."
+            "Preview is ON for an unapproved candidate profile. This is allowed for engineering tests, "
+            "but scientific use requires preview-on qualification and a matching locked config."
         )
     if str(cfg.camera.expected_pixel_format).upper() in {"RGB8", "BGR8"}:
         return "RGB/BGR camera output triples the USB payload; run the validation sweep before scientific color recording."
-    if cfg.recording_profile.pixel_fidelity == "lossless":
-        return "Preview is enabled during lossless calibration; keep runs short and confirm QC after recording."
     return ""
 
 
