@@ -17,13 +17,14 @@ from unittest import mock
 
 import yaml
 
-from pycamrec.acquisition import _source_hash_frame_indices
+from pycamrec.acquisition import Recorder, RecordingStats, _source_hash_frame_indices
 from pycamrec.approval import lock_profile_from_summary
 from pycamrec.cli import main as cli_main
 from pycamrec.config import load_config
 from pycamrec.gui import (
     _disk_estimate_text,
     _integrated_preview_sink,
+    _manual_run_index_value,
     _preview_warning_text,
     _profile_qualification_text,
 )
@@ -1036,6 +1037,12 @@ class GuiReadinessTextTests(unittest.TestCase):
         self.assertNotIn("failed the latest timing run", warning)
         self.assertIn("CANDIDATE", _profile_qualification_text(cfg))
 
+    def test_manual_run_index_requires_a_positive_integer(self) -> None:
+        self.assertEqual(_manual_run_index_value("17"), 17)
+        for invalid in ("", "0", "-1", "abc"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _manual_run_index_value(invalid)
+
     def test_locked_preview_on_certificate_is_reported_separately(self) -> None:
         cfg = self._cfg({})
         fingerprint = build_profile_fingerprint(
@@ -1053,6 +1060,33 @@ class GuiReadinessTextTests(unittest.TestCase):
         }
         self.assertEqual(_preview_warning_text(cfg), "")
         self.assertIn("LOCK CERTIFICATE PRESENT", _profile_qualification_text(cfg))
+
+
+class AcquisitionHealthTests(unittest.TestCase):
+    def test_health_check_duration_is_recorded_in_stats_and_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = Recorder.__new__(Recorder)
+            recorder.cfg = SimpleNamespace(
+                writer=SimpleNamespace(min_free_space_gb=0.0),
+                camera=SimpleNamespace(
+                    temperature_warning_c=70.0,
+                    temperature_critical_c=76.0,
+                ),
+            )
+            recorder.stats = RecordingStats()
+            recorder.stop_event = mock.Mock()
+            metadata = SimpleNamespace(session_dir=Path(tmp), log_event=mock.Mock())
+            camera = SimpleNamespace(read_temperature_c=mock.Mock(return_value=55.0))
+
+            with mock.patch("pycamrec.acquisition.time.perf_counter", side_effect=(10.0, 10.0125)):
+                recorder._record_segment_health(camera, metadata, 2, reason="periodic")
+
+            self.assertEqual(recorder.stats.health_checks, 1)
+            self.assertEqual(recorder.stats.last_health_check_duration_ms, 12.5)
+            self.assertEqual(recorder.stats.max_health_check_duration_ms, 12.5)
+            event = metadata.log_event.call_args.args[1]
+            self.assertEqual(event["check_duration_ms"], 12.5)
+            recorder.stop_event.set.assert_not_called()
 
 
 if __name__ == "__main__":

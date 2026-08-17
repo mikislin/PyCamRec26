@@ -335,6 +335,7 @@ class PyCamRecApp:
         self.preview_fps_var = tk.StringVar(value="10")
         self.preview_display_mode_var = tk.StringVar(value="Auto")
         self.allow_unspecified_var = tk.BooleanVar(value=False)
+        self.auto_run_index_var = tk.BooleanVar(value=True)
         self.onboard_pixel_format_var = tk.StringVar(value="Mono8")
         self.onboard_expected_fps_var = tk.StringVar(value="")
         self.onboard_segment_seconds_var = tk.StringVar(value="120")
@@ -655,13 +656,22 @@ class PyCamRecApp:
                 ).pack(side=tk.LEFT, padx=(4, 0))
             elif field_name == "run_index":
                 widget = ttk.Frame(frame)
-                ttk.Entry(
+                run_index_entry = ttk.Entry(
                     widget,
                     textvariable=self.metadata_vars[field_name],
-                    state="readonly",
                     width=8,
-                ).pack(side=tk.LEFT)
-                ttk.Button(widget, text="Recalculate", command=self._set_next_run_index).pack(
+                )
+                run_index_entry.pack(side=tk.LEFT)
+                run_index_entry.bind("<KeyPress>", self._on_manual_run_index_edit)
+                run_index_entry.bind("<<Paste>>", lambda _event: self._on_manual_run_index_edit())
+                run_index_entry.bind("<<Cut>>", lambda _event: self._on_manual_run_index_edit())
+                ttk.Checkbutton(
+                    widget,
+                    text="Automatic next",
+                    variable=self.auto_run_index_var,
+                    command=self._on_auto_run_index_changed,
+                ).pack(side=tk.LEFT, padx=(6, 0))
+                ttk.Button(widget, text="Use next", command=self._use_next_run_index).pack(
                     side=tk.LEFT, padx=(4, 0)
                 )
             else:
@@ -953,6 +963,7 @@ class PyCamRecApp:
             var.trace_add("write", lambda *_args: self.root.after_idle(self._load_profile_summary))
         self.preview_enabled_var.trace_add("write", lambda *_args: self.root.after_idle(self._load_profile_summary))
         self.allow_unspecified_var.trace_add("write", lambda *_args: self.root.after_idle(self._refresh_start_state))
+        self.auto_run_index_var.trace_add("write", lambda *_args: self.root.after_idle(self._refresh_start_state))
         for field_name, var in self.metadata_vars.items():
             var.trace_add("write", lambda *_args: self.root.after_idle(self._refresh_start_state))
             if field_name != "run_index":
@@ -960,6 +971,8 @@ class PyCamRecApp:
         self.output_root_var.trace_add("write", lambda *_args: self._schedule_run_index_refresh())
 
     def _schedule_run_index_refresh(self) -> None:
+        if not self.auto_run_index_var.get():
+            return
         if self.run_index_refresh_job is not None:
             try:
                 self.root.after_cancel(self.run_index_refresh_job)
@@ -969,7 +982,8 @@ class PyCamRecApp:
 
     def _refresh_run_index_silently(self) -> None:
         self.run_index_refresh_job = None
-        self._set_next_run_index(show_error=False)
+        if self.auto_run_index_var.get():
+            self._set_next_run_index(show_error=False)
 
     def _on_profile_choice(self) -> None:
         path = PROFILE_PATH_BY_LABEL.get(self.profile_choice_var.get())
@@ -1097,6 +1111,7 @@ class PyCamRecApp:
         try:
             document = load_experiment_metadata_json(Path(path))
             self._apply_metadata_document(document)
+            self.auto_run_index_var.set(True)
             self._set_next_run_index()
         except Exception as exc:
             messagebox.showerror("Could not load metadata", str(exc))
@@ -1106,7 +1121,7 @@ class PyCamRecApp:
 
     def save_metadata_json(self) -> None:
         try:
-            self._set_next_run_index()
+            self._prepare_run_index()
             document = self._metadata_values()
         except Exception as exc:
             messagebox.showerror("Could not prepare metadata", str(exc))
@@ -1214,6 +1229,34 @@ class PyCamRecApp:
             return None
         self.metadata_vars["run_index"].set(str(run_index))
         return run_index
+
+    def _on_manual_run_index_edit(self, _event: tk.Event[Any] | None = None) -> None:
+        if _event is not None:
+            keysym = str(getattr(_event, "keysym", ""))
+            character = str(getattr(_event, "char", ""))
+            if keysym not in {"BackSpace", "Delete"} and not (
+                character and character.isprintable()
+            ):
+                return
+        self.auto_run_index_var.set(False)
+
+    def _on_auto_run_index_changed(self) -> None:
+        if self.auto_run_index_var.get():
+            self._set_next_run_index()
+        else:
+            self._refresh_start_state()
+
+    def _use_next_run_index(self) -> None:
+        self.auto_run_index_var.set(True)
+        self._set_next_run_index()
+
+    def _prepare_run_index(self) -> int:
+        if self.auto_run_index_var.get():
+            run_index = self._set_next_run_index()
+            if run_index is None:
+                raise ValueError("Could not calculate the next run index.")
+            return run_index
+        return _manual_run_index_value(self.metadata_vars["run_index"].get())
 
     def generate_onboarding_config(self) -> None:
         try:
@@ -1489,6 +1532,7 @@ class PyCamRecApp:
         )
 
     def reset_metadata(self) -> None:
+        self.auto_run_index_var.set(True)
         for field_name, _ in METADATA_FIELDS:
             self.metadata_vars[field_name].set(
                 "mouse" if field_name == "species" else "1" if field_name == "run_index" else ""
@@ -1671,9 +1715,7 @@ class PyCamRecApp:
             return
 
         try:
-            run_index = self._set_next_run_index()
-            if run_index is None:
-                raise ValueError("Could not calculate the next run index.")
+            self._prepare_run_index()
             runtime_config = self._write_runtime_config()
             cfg = load_config(runtime_config)
             device_report = _run_pycamrec_json(["devices"], timeout_s=45)
@@ -2487,7 +2529,8 @@ class PyCamRecApp:
         self._append_output(f"=== Recording process exited with code {return_code} ===\n")
         self.logger.info("Recording exited with code %s", return_code)
         self.refresh_sessions()
-        self._set_next_run_index()
+        if self.auto_run_index_var.get():
+            self._set_next_run_index()
         self._refresh_start_state()
         if return_code == 0 and self.last_session_dir is not None:
             try:
@@ -2890,6 +2933,13 @@ def _optional_gui_int(value: str, label: str) -> int | None:
         return int(text)
     except ValueError as exc:
         raise ValueError(f"{label} must be an integer.") from exc
+
+
+def _manual_run_index_value(value: str) -> int:
+    run_index = _optional_gui_int(value.strip(), "Run index")
+    if run_index is None or run_index <= 0:
+        raise ValueError("Run index must be a positive integer.")
+    return run_index
 
 
 def _optional_gui_float(value: str, label: str) -> float | None:

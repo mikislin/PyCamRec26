@@ -45,6 +45,8 @@ class RecordingStats:
     health_checks: int = 0
     health_warnings: int = 0
     health_critical_events: int = 0
+    last_health_check_duration_ms: float | None = None
+    max_health_check_duration_ms: float = 0.0
     last_free_space_gb: float | None = None
     last_camera_temperature_c: float | None = None
     writer_spool_enabled: bool = False
@@ -442,6 +444,7 @@ class Recorder:
         *,
         reason: str,
     ) -> None:
+        health_check_started = time.perf_counter()
         disk_usage = shutil.disk_usage(metadata.session_dir)
         free_space_gb = disk_usage.free / (1024**3)
         temperature_c = camera.read_temperature_c()
@@ -461,7 +464,13 @@ class Recorder:
                 f"{self.cfg.camera.temperature_critical_c:.1f} C"
             )
 
+        health_check_duration_ms = (time.perf_counter() - health_check_started) * 1000.0
         self.stats.health_checks += 1
+        self.stats.last_health_check_duration_ms = round(health_check_duration_ms, 3)
+        self.stats.max_health_check_duration_ms = max(
+            self.stats.max_health_check_duration_ms,
+            round(health_check_duration_ms, 3),
+        )
         self.stats.last_free_space_gb = round(free_space_gb, 3)
         self.stats.last_camera_temperature_c = (
             round(temperature_c, 3) if temperature_c is not None else None
@@ -473,7 +482,8 @@ class Recorder:
         temperature_text = f"{temperature_c:.1f} C" if temperature_c is not None else "unknown"
         message = (
             f"[PyCamRec] Health {status}: segment={segment_id}, reason={reason}, "
-            f"free={free_space_gb:.1f} GiB, camera_temp={temperature_text}"
+            f"free={free_space_gb:.1f} GiB, camera_temp={temperature_text}, "
+            f"check_ms={health_check_duration_ms:.1f}"
         )
         if warnings or critical:
             message += " (" + "; ".join(critical + warnings) + ")"
@@ -489,6 +499,7 @@ class Recorder:
                 "camera_temperature_c": (
                     round(temperature_c, 3) if temperature_c is not None else None
                 ),
+                "check_duration_ms": round(health_check_duration_ms, 3),
                 "temperature_warning_c": self.cfg.camera.temperature_warning_c,
                 "temperature_critical_c": self.cfg.camera.temperature_critical_c,
                 "min_free_space_gb": self.cfg.writer.min_free_space_gb,

@@ -122,7 +122,7 @@ In the GUI, **Selected profile** describes encoder intent. **Profile qualificati
 
 The v2 experiment schema uses typed subject and acquisition fields. Weight is a numeric value in grams, postnatal day is a non-negative integer, P0 means the birth date, dates use `YYYY-MM-DD`, and timestamps include a timezone. If DOB and P-day are both present, they must agree on the UTC recording date. The old `animal_id`, `dob`, `test_assay_name`, `experimentator`, and `project_protocol` keys remain readable as v1 aliases but new sessions are written as v2.
 
-The GUI can load a config JSON, a previous `experiment_metadata.json`, or a `session.json`. It imports only user-entered experiment fields, never the old session's automatic hardware/session values. DOB and weight-measurement fields have calendar pickers; **Today** derives P0/PND from DOB, and **Now** records a timezone-aware UTC weight timestamp. **Run index** is read-only: at recording start PyCamRec finds sessions with otherwise identical metadata and assigns `max(previous run index) + 1`. A private hash-only state file also prevents reuse when a process starts but does not leave a completed session.
+The GUI can load a config JSON, a previous `experiment_metadata.json`, or a `session.json`. It imports only user-entered experiment fields, never the old session's automatic hardware/session values. DOB and weight-measurement fields have calendar pickers; **Today** derives P0/PND from DOB, and **Now** records a timezone-aware UTC weight timestamp. **Run index** defaults to **Automatic next**: at recording start PyCamRec finds sessions with otherwise identical metadata and assigns `max(previous run index) + 1`. Editing the number switches to a manual override; **Use next** restores automatic mode. Manual values must be positive integers, and duplicated run numbers should only be used intentionally. A private hash-only state file prevents automatic reuse when a process starts but does not leave a completed session.
 
 ```yaml
 experiment:
@@ -183,7 +183,9 @@ Safe stop behavior:
 
 ## Storage and temperature safety
 
-The GUI and preflight use `writer.expected_bitrate_mbps` from the camera config before any generic profile estimate. They show requested output size, free-space margin, and approximate duration at the target rate. Health checks read free space and internal camera temperature every 10 seconds, not only at segment boundaries. Crossing the disk reserve or critical internal-temperature threshold requests a safe stop and prevents experiment readiness.
+The GUI and preflight use `writer.expected_bitrate_mbps` from the camera config before any generic profile estimate. They show requested output size, free-space margin, and approximate duration at the target rate. Health checks read free space and internal camera temperature every 10 seconds, not only at segment boundaries. Each health line and session summary report the last and maximum check duration in milliseconds (`check_ms`, `last_health_check_duration_ms`, and `max_health_check_duration_ms`). Crossing the disk reserve or critical internal-temperature threshold requests a safe stop and prevents experiment readiness.
+
+Keep the 10-second interval for CXP qualification. The check runs in the writer/consumer path while acquisition continues into the bounded queue; it does not pause the camera. A 30-second interval provides less safety and, at the approximately 4 Gbps lossless rate, can allow roughly 15 GB to be written between disk checks instead of about 5 GB. Change the interval only after a qualification run shows a material `check_ms` cost and the full intended configuration is requalified.
 
 For CXP lossless, plan for **30 GB/min**:
 
@@ -217,6 +219,16 @@ Reports for sessions that are still being written return `qc.status: in_progress
 ## Hardware validation and profile locking
 
 Validation automatically shortens each case's segment length to at most half the duration, so every successful case must roll over once and then finalize the last MP4. Source hashes capped with `--source-frame-hash-max-frames` are distributed from the beginning through the end of the planned session. Limited decoding also samples across the session and always includes source-hashed frames. A lock requires three passing repetitions at the maximum duration, health evidence, queue below 25%, stable end-of-run backlog, one hardware fingerprint, one resolved profile fingerprint, complete metadata, and exact sampled pixels for lossless profiles.
+
+GUI qualification workflow:
+
+1. Complete **Recording metadata**; qualification evidence with unspecified metadata cannot be locked.
+2. On **Profile qualification**, select the candidate YAML and matching camera PFS, then use **Detect camera caps**.
+3. Set the intended durations, preview mode, required repetitions, and rollover segment length. Preview on and off are separate approvals.
+4. For a lossy profile, select a completed task-quality record; for a lossless profile, configure source/pixel hashing.
+5. Use **Run qualification sweep**. Exit code 0 means the sweep completed, not that it passed; review `validation_summary.json`.
+6. If the summary recommends a lock, use **Create locked config...**, choose its preview mode, and select the resulting config for experiments.
+7. Run **Preflight** from **Setup & Record**. Startup still verifies the live camera/PFS/GPU/driver/host/software fingerprint.
 
 Print the complete cases, exact command, and disk budget without recording:
 

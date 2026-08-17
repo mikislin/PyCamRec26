@@ -4,6 +4,7 @@
 
 - Separated GUI profile qualification, current recording setup, and metadata readiness; removed the hard-coded stale CXP preview-failure banner in favor of certificate-derived preview coverage.
 - Added metadata JSON load/save, dependency-free DOB and weight timestamp calendar controls, Today/Now actions, typed custom-field shorthand, and hash-backed automatic run-index sequencing.
+- Made run indices manually overridable while keeping automatic-next as the default, and added per-check health-duration telemetry for qualification.
 - Added naming schema v2 with task/date folders, subject/PND/task/run session names, matching segment filename prefixes, and UUID identity retained in metadata.
 - Added non-overwriting `pycamrec report --output` JSON generation and documented custom-config qualification in PowerShell and CMD.
 - Added typed metadata v2 with subject weight, postnatal day/P0 semantics, project/protocol/assay identifiers, experimenter/run identifiers, validated custom fields, and a published JSON Schema.
