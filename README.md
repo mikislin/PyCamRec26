@@ -20,6 +20,29 @@ pip uninstall -y pypylon
 pip install pypylon==4.0.0
 ```
 
+```powershell
+conda env create --name pycamrec --file environment.yml
+
+conda activate pycamrec
+
+python -m pip install --editable ".[basler,preview,test]"
+```
+
+Verify the installation
+```powershell
+python --version
+python -m pycamrec --help
+python -m pycamrec profiles
+python -m pytest -q
+python scripts\release_audit.py
+```
+
+Launch the Windows desktop app with:
+
+```powershell
+python -m pycamrec gui
+```
+
 The current user-facing configs are profile based. Provide the duration from the command line:
 
 ```powershell
@@ -28,12 +51,6 @@ python -m pycamrec record configs/pycamrec_basler_a2A2448_profile_long_lossy.yam
 python -m pycamrec report C:\PyCamRecSessions\<session_folder>
 ```
 
-
-Launch the Windows desktop app with:
-
-```powershell
-python -m pycamrec gui
-```
 
 Live preview is optional and deliberately best-effort. Recording frames always go to the writer queue first; preview receives only the latest sampled frame and silently drops preview updates if display cannot keep up. For the GUI sink, the recorder publishes a sampled raw Mono8 frame and per-frame status into shared memory, while the GUI process handles preview downsampling/display.
 
