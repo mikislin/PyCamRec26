@@ -66,3 +66,10 @@ During recordings PyCamRec prints a health line after each segment closes. It re
 
 To interrupt a long run, press Ctrl-C once and wait for PyCamRec to print that the session was finalized and the camera was released. It will stop acquisition, drain queued frames, close the current video segment, flush metadata, and write the session summary.
 
+
+# TODO
+1. Fix delay between starting video recording and camera initialization
+2. Add LUT options (inferno, spectrum...) for preview to help with lighting calibration
+3. Add room temperature to the metadata
+4. data transfer and backup
+5. archiving recordings with metadata to the NWB format for publications
